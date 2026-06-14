@@ -1,0 +1,14 @@
+{
+  "name": "repo-viewer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local GitHub repository visual browser with file tree, preview, and translation layer.",
+  "scripts": {
+    "start": "node server/index.js",
+    "check": "node server/index.js --check"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

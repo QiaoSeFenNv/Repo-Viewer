@@ -1,0 +1,1000 @@
+import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
+import { createReadStream, existsSync } from "node:fs";
+import { lstat, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import { extname, join, relative, resolve, sep } from "node:path";
+import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
+
+const __dirname = fileURLToPath(new URL(".", import.meta.url));
+const projectRoot = resolve(__dirname, "..");
+const staticRoot = join(projectRoot, "src");
+const defaultRepoRoot = resolve(projectRoot, "..", "ECC-main");
+const execFileAsync = promisify(execFile);
+let googleFetchMode = "auto";
+
+async function loadEnvFile() {
+  const envPath = join(projectRoot, ".env");
+  if (!existsSync(envPath)) return;
+
+  const content = await readFile(envPath, "utf8");
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const separator = line.indexOf("=");
+    if (separator < 1) continue;
+    const key = line.slice(0, separator).trim();
+    let value = line.slice(separator + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (!(key in process.env)) process.env[key] = value;
+  }
+}
+
+await loadEnvFile();
+
+const port = Number(process.env.PORT || 4173);
+const maxTextBytes = Number(process.env.MAX_TEXT_BYTES || 1024 * 1024);
+const maxTreeEntries = Number(process.env.MAX_TREE_ENTRIES || 12000);
+
+const ignoredNames = new Set([
+  ".git",
+  ".hg",
+  ".svn",
+  "node_modules",
+  ".next",
+  ".nuxt",
+  "dist",
+  "build",
+  "coverage",
+  ".cache",
+  ".turbo",
+  "__pycache__"
+]);
+
+const binaryExtensions = new Set([
+  ".7z",
+  ".avi",
+  ".bmp",
+  ".class",
+  ".dll",
+  ".doc",
+  ".docx",
+  ".exe",
+  ".gif",
+  ".gz",
+  ".ico",
+  ".jar",
+  ".jpeg",
+  ".jpg",
+  ".mov",
+  ".mp3",
+  ".mp4",
+  ".pdf",
+  ".png",
+  ".ppt",
+  ".pptx",
+  ".pyc",
+  ".rar",
+  ".so",
+  ".ttf",
+  ".webp",
+  ".woff",
+  ".woff2",
+  ".xls",
+  ".xlsx",
+  ".zip"
+]);
+
+const imageExtensions = new Set([".gif", ".ico", ".jpeg", ".jpg", ".png", ".svg", ".webp"]);
+
+const mimeTypes = new Map([
+  [".css", "text/css; charset=utf-8"],
+  [".html", "text/html; charset=utf-8"],
+  [".js", "text/javascript; charset=utf-8"],
+  [".json", "application/json; charset=utf-8"],
+  [".map", "application/json; charset=utf-8"],
+  [".svg", "image/svg+xml"],
+  [".png", "image/png"],
+  [".jpg", "image/jpeg"],
+  [".jpeg", "image/jpeg"],
+  [".gif", "image/gif"],
+  [".webp", "image/webp"],
+  [".ico", "image/x-icon"]
+]);
+
+const languageByExtension = new Map([
+  [".c", "C"],
+  [".cc", "C++"],
+  [".cpp", "C++"],
+  [".cs", "C#"],
+  [".css", "CSS"],
+  [".go", "Go"],
+  [".html", "HTML"],
+  [".java", "Java"],
+  [".js", "JavaScript"],
+  [".jsx", "JavaScript"],
+  [".json", "JSON"],
+  [".kt", "Kotlin"],
+  [".md", "Markdown"],
+  [".mjs", "JavaScript"],
+  [".py", "Python"],
+  [".rb", "Ruby"],
+  [".rs", "Rust"],
+  [".sh", "Shell"],
+  [".sql", "SQL"],
+  [".ts", "TypeScript"],
+  [".tsx", "TypeScript"],
+  [".txt", "Text"],
+  [".xml", "XML"],
+  [".yaml", "YAML"],
+  [".yml", "YAML"]
+]);
+
+const translatableExtensions = new Set([".md", ".markdown", ".mdx", ".txt", ".rst", ".adoc"]);
+const codeExtensions = new Set([
+  ".c",
+  ".cc",
+  ".cpp",
+  ".cs",
+  ".css",
+  ".go",
+  ".html",
+  ".java",
+  ".js",
+  ".jsx",
+  ".json",
+  ".kt",
+  ".mjs",
+  ".php",
+  ".py",
+  ".rb",
+  ".rs",
+  ".sh",
+  ".sql",
+  ".ts",
+  ".tsx",
+  ".xml",
+  ".yaml",
+  ".yml"
+]);
+
+const translationCache = new Map();
+
+function sendJson(response, statusCode, payload) {
+  const body = JSON.stringify(payload);
+  response.writeHead(statusCode, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store"
+  });
+  response.end(body);
+}
+
+function sendError(response, statusCode, message, detail) {
+  sendJson(response, statusCode, { error: message, detail });
+}
+
+function safeRoot(inputRoot) {
+  const root = resolve(inputRoot || defaultRepoRoot);
+  if (!existsSync(root)) {
+    const error = new Error(`Repository path does not exist: ${root}`);
+    error.statusCode = 404;
+    throw error;
+  }
+  return root;
+}
+
+function safeRepoPath(root, inputPath = "") {
+  const normalizedInput = String(inputPath).replaceAll("\\", "/");
+  const absolutePath = resolve(root, normalizedInput);
+  const relativePath = relative(root, absolutePath);
+  if (relativePath.startsWith("..") || relativePath === ".." || absolutePath === root + sep) {
+    const error = new Error("Path is outside the selected repository.");
+    error.statusCode = 400;
+    throw error;
+  }
+  return absolutePath;
+}
+
+function toRepoPath(root, absolutePath) {
+  return relative(root, absolutePath).replaceAll("\\", "/");
+}
+
+function isIgnored(name) {
+  return ignoredNames.has(name) || name.endsWith(".log") || name.endsWith(".lockb");
+}
+
+function classifyFile(filePath, size) {
+  const extension = extname(filePath).toLowerCase();
+  const isImage = imageExtensions.has(extension);
+  const isBinary = binaryExtensions.has(extension) && !extension.endsWith(".svg");
+  const isMarkdown = extension === ".md" || extension === ".markdown" || extension === ".mdx";
+  const isCode = codeExtensions.has(extension) && !isMarkdown;
+  return {
+    extension,
+    language: languageByExtension.get(extension) || (extension ? extension.slice(1).toUpperCase() : "Text"),
+    isMarkdown,
+    isCode,
+    translatable: translatableExtensions.has(extension) || (!extension && size <= maxTextBytes),
+    isImage,
+    isBinary,
+    isLarge: size > maxTextBytes
+  };
+}
+
+function sortNodes(a, b) {
+  if (a.type !== b.type) {
+    return a.type === "directory" ? -1 : 1;
+  }
+  return a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+}
+
+async function countDirectoryChildren(dirPath) {
+  const entries = await readdir(dirPath, { withFileTypes: true });
+  let count = 0;
+  for (const entry of entries) {
+    if (isIgnored(entry.name)) continue;
+    count += 1;
+  }
+  return count;
+}
+
+async function readDirectoryLevel(root, dirPath) {
+  const entries = await readdir(dirPath, { withFileTypes: true });
+  const children = [];
+
+  for (const entry of entries) {
+    if (isIgnored(entry.name)) continue;
+
+    const absolutePath = join(dirPath, entry.name);
+    const entryStats = await lstat(absolutePath);
+    if (entryStats.isSymbolicLink()) continue;
+
+    const repoPath = toRepoPath(root, absolutePath);
+
+    if (entry.isDirectory()) {
+      children.push({
+        id: repoPath || ".",
+        type: "directory",
+        name: entry.name,
+        path: repoPath,
+        loaded: false,
+        childCount: await countDirectoryChildren(absolutePath),
+        children: []
+      });
+      continue;
+    }
+
+    if (entry.isFile()) {
+      const classification = classifyFile(absolutePath, entryStats.size);
+      children.push({
+        id: repoPath,
+        type: "file",
+        name: entry.name,
+        path: repoPath,
+        size: entryStats.size,
+        modifiedAt: entryStats.mtime.toISOString(),
+        ...classification
+      });
+    }
+  }
+
+  return children.sort(sortNodes);
+}
+
+async function handleTree(requestUrl, response) {
+  const root = safeRoot(requestUrl.searchParams.get("root"));
+  const repoPath = requestUrl.searchParams.get("path") || "";
+  const dirPath = safeRepoPath(root, repoPath);
+  const dirStats = await stat(dirPath);
+  if (!dirStats.isDirectory()) {
+    sendError(response, 400, "Selected path is not a directory.");
+    return;
+  }
+
+  const children = await readDirectoryLevel(root, dirPath);
+  const tree = {
+    id: repoPath || ".",
+    type: "directory",
+    name: repoPath ? repoPath.split("/").at(-1) : root.split(/[\\/]/).at(-1) || root,
+    path: repoPath,
+    root,
+    generatedAt: new Date().toISOString(),
+    loaded: true,
+    childCount: children.length,
+    children
+  };
+  sendJson(response, 200, tree);
+}
+
+function detectText(buffer) {
+  if (buffer.includes(0)) return false;
+  const sample = buffer.subarray(0, 4096).toString("utf8");
+  return !sample.includes("\uFFFD");
+}
+
+async function handleFile(requestUrl, response) {
+  const root = safeRoot(requestUrl.searchParams.get("root"));
+  const repoPath = requestUrl.searchParams.get("path") || "";
+  const absolutePath = safeRepoPath(root, repoPath);
+  const fileStats = await stat(absolutePath);
+
+  if (!fileStats.isFile()) {
+    sendError(response, 400, "Selected path is not a file.");
+    return;
+  }
+
+  const classification = classifyFile(absolutePath, fileStats.size);
+  const headerBuffer = await readFile(absolutePath, { encoding: null }).then((buffer) => buffer.subarray(0, 4096));
+  const isText = !classification.isBinary && detectText(headerBuffer);
+
+  if (!isText || classification.isImage) {
+    sendJson(response, 200, {
+      path: toRepoPath(root, absolutePath),
+      name: absolutePath.split(/[\\/]/).at(-1),
+      size: fileStats.size,
+      modifiedAt: fileStats.mtime.toISOString(),
+      content: "",
+      rawUrl: `/api/raw?root=${encodeURIComponent(root)}&path=${encodeURIComponent(toRepoPath(root, absolutePath))}`,
+      text: false,
+      ...classification
+    });
+    return;
+  }
+
+  const fullBuffer = await readFile(absolutePath, { encoding: null });
+  const limited = fullBuffer.subarray(0, maxTextBytes);
+  const content = limited.toString("utf8");
+  const hash = createHash("sha256").update(fullBuffer).digest("hex");
+
+  sendJson(response, 200, {
+    path: toRepoPath(root, absolutePath),
+    name: absolutePath.split(/[\\/]/).at(-1),
+    size: fileStats.size,
+    modifiedAt: fileStats.mtime.toISOString(),
+    content,
+    hash,
+    text: true,
+    truncated: fullBuffer.byteLength > maxTextBytes,
+    ...classification
+  });
+}
+
+async function handleRaw(requestUrl, response) {
+  const root = safeRoot(requestUrl.searchParams.get("root"));
+  const absolutePath = safeRepoPath(root, requestUrl.searchParams.get("path") || "");
+  const fileStats = await stat(absolutePath);
+  if (!fileStats.isFile()) {
+    sendError(response, 400, "Selected path is not a file.");
+    return;
+  }
+
+  const extension = extname(absolutePath).toLowerCase();
+  response.writeHead(200, {
+    "content-type": mimeTypes.get(extension) || "application/octet-stream",
+    "content-length": fileStats.size
+  });
+  createReadStream(absolutePath).pipe(response);
+}
+
+function preserveCodeBlocks(markdown) {
+  const blocks = [];
+  const protectedText = markdown.replace(/```[\s\S]*?```/g, (block) => {
+    const token = `__CODE_BLOCK_${blocks.length}__`;
+    blocks.push(block);
+    return token;
+  });
+  return { protectedText, restore: (text) => text.replace(/__CODE_BLOCK_(\d+)__/g, (_, index) => blocks[Number(index)] || "") };
+}
+
+function shouldTranslateFile(body) {
+  const extension = extname(String(body.path || "")).toLowerCase();
+  return translatableExtensions.has(extension) || (!extension && String(body.text || "").length < 20000);
+}
+
+function splitMarkdownForTranslation(markdown) {
+  const parts = [];
+  const pattern = /(```[\s\S]*?```|`[^`\n]+`)/g;
+  let lastIndex = 0;
+  for (const match of markdown.matchAll(pattern)) {
+    if (match.index > lastIndex) {
+      parts.push({ type: "text", value: markdown.slice(lastIndex, match.index) });
+    }
+    parts.push({ type: "code", value: match[0] });
+    lastIndex = match.index + match[0].length;
+  }
+  if (lastIndex < markdown.length) {
+    parts.push({ type: "text", value: markdown.slice(lastIndex) });
+  }
+  return parts;
+}
+
+async function translateMarkdownWithoutCode(markdown, targetLanguage, sourceLanguage) {
+  const protectedBlocks = [];
+  const protectedText = markdown.replace(/```[\s\S]*?```|`[^`\n]+`/g, (block) => {
+    const token = `ZXCVREPOVIEWERCODE${protectedBlocks.length}ZXCV`;
+    protectedBlocks.push(block);
+    return token;
+  });
+  const translatedChunks = [];
+  for (const chunk of splitForTranslation(protectedText)) {
+    const leading = chunk.match(/^\s*/)?.[0] || "";
+    const trailing = chunk.match(/\s*$/)?.[0] || "";
+    const core = chunk.slice(leading.length, chunk.length - trailing.length);
+    const translated = await remoteTranslate(core, targetLanguage, sourceLanguage);
+    if (!translated) throw new Error("Translation provider is not configured.");
+    translatedChunks.push(`${leading}${translated}${trailing}`);
+  }
+  return translatedChunks
+    .join("\n\n")
+    .replace(/ZXCVREPOVIEWERCODE(\d+)ZXCV/g, (_match, index) => protectedBlocks[Number(index)] || "");
+}
+
+function localTranslateMarkdownWithoutCode(markdown, targetLanguage) {
+  const languageLabel = { "zh-CN": "简体中文", en: "English", ja: "日本語", ko: "한국어" }[targetLanguage] || targetLanguage;
+  const body = splitMarkdownForTranslation(markdown)
+    .map((part) => (part.type === "code" ? part.value : localGlossaryReplace(part.value, targetLanguage)))
+    .join("");
+  return `> 未配置可用的远程翻译服务，以下内容仅使用本地术语表替换（${languageLabel}），不是完整翻译。\n\n${body}`;
+}
+
+const localGlossaries = {
+  "zh-CN": new Map([
+    ["Repository", "仓库"],
+    ["repository", "仓库"],
+    ["File", "文件"],
+    ["file", "文件"],
+    ["Folder", "文件夹"],
+    ["folder", "文件夹"],
+    ["Command", "命令"],
+    ["command", "命令"],
+    ["Install", "安装"],
+    ["install", "安装"],
+    ["Configuration", "配置"],
+    ["configuration", "配置"],
+    ["Agent", "智能体"],
+    ["agent", "智能体"],
+    ["Skill", "技能"],
+    ["skill", "技能"],
+    ["Rule", "规则"],
+    ["rule", "规则"],
+    ["Workflow", "工作流"],
+    ["workflow", "工作流"],
+    ["Security", "安全"],
+    ["security", "安全"],
+    ["Test", "测试"],
+    ["test", "测试"],
+    ["Development", "开发"],
+    ["development", "开发"]
+  ]),
+  ja: new Map([
+    ["Repository", "リポジトリ"],
+    ["repository", "リポジトリ"],
+    ["File", "ファイル"],
+    ["file", "ファイル"],
+    ["Folder", "フォルダ"],
+    ["folder", "フォルダ"],
+    ["Command", "コマンド"],
+    ["command", "コマンド"],
+    ["Install", "インストール"],
+    ["install", "インストール"],
+    ["Security", "セキュリティ"],
+    ["security", "セキュリティ"]
+  ]),
+  ko: new Map([
+    ["Repository", "저장소"],
+    ["repository", "저장소"],
+    ["File", "파일"],
+    ["file", "파일"],
+    ["Folder", "폴더"],
+    ["folder", "폴더"],
+    ["Command", "명령"],
+    ["command", "명령"],
+    ["Install", "설치"],
+    ["install", "설치"],
+    ["Security", "보안"],
+    ["security", "보안"]
+  ]),
+  en: new Map([
+    ["仓库", "repository"],
+    ["文件", "file"],
+    ["文件夹", "folder"],
+    ["命令", "command"],
+    ["安装", "install"],
+    ["配置", "configuration"],
+    ["智能体", "agent"],
+    ["技能", "skill"],
+    ["规则", "rule"],
+    ["工作流", "workflow"],
+    ["安全", "security"],
+    ["测试", "test"],
+    ["开发", "development"]
+  ])
+};
+
+const repoLanguageDirs = {
+  "zh-CN": "zh-CN",
+  en: "en",
+  ja: "ja-JP",
+  ko: "ko-KR"
+};
+
+function candidateTranslationPaths(sourcePath, targetLanguage) {
+  const normalizedPath = String(sourcePath || "").replaceAll("\\", "/");
+  if (!normalizedPath) return [];
+
+  const targetDir = repoLanguageDirs[targetLanguage] || targetLanguage;
+  const candidates = [];
+  const segments = normalizedPath.split("/");
+  const fileName = segments.at(-1) || "";
+  const extension = extname(fileName);
+  const stem = extension ? fileName.slice(0, -extension.length) : fileName;
+
+  if (targetLanguage === "en") {
+    if (fileName === "README.zh-CN.md" || fileName === "README.zh-TW.md") candidates.push("README.md");
+    if (segments[0] === "docs" && segments.length > 2) candidates.push(segments.slice(2).join("/"));
+  }
+
+  if (normalizedPath === "README.md") {
+    candidates.push(`README.${targetDir}.md`, `docs/${targetDir}/README.md`);
+  }
+
+  if (!normalizedPath.startsWith("docs/")) {
+    candidates.push(`docs/${targetDir}/${normalizedPath}`);
+  }
+
+  if (extension) {
+    const sibling = [...segments.slice(0, -1), `${stem}.${targetDir}${extension}`].join("/");
+    candidates.push(sibling);
+  }
+
+  if (segments[0] === "docs" && segments.length > 2) {
+    const replaced = ["docs", targetDir, ...segments.slice(2)].join("/");
+    candidates.push(replaced);
+  }
+
+  return [...new Set(candidates.filter((candidate) => candidate !== normalizedPath))];
+}
+
+async function findRepositoryTranslation(root, sourcePath, targetLanguage) {
+  if (!root || !sourcePath) return null;
+
+  for (const candidate of candidateTranslationPaths(sourcePath, targetLanguage)) {
+    const absolutePath = safeRepoPath(root, candidate);
+    if (!existsSync(absolutePath)) continue;
+
+    const fileStats = await stat(absolutePath);
+    if (!fileStats.isFile() || fileStats.size > maxTextBytes) continue;
+
+    const buffer = await readFile(absolutePath, { encoding: null });
+    if (!detectText(buffer.subarray(0, 4096))) continue;
+
+    return {
+      translatedText: buffer.toString("utf8"),
+      candidatePath: candidate
+    };
+  }
+
+  return null;
+}
+
+function localGlossaryReplace(text, targetLanguage) {
+  const glossary = localGlossaries[targetLanguage] || localGlossaries["zh-CN"];
+  let translated = text;
+  for (const [source, target] of glossary.entries()) {
+    translated = translated.replaceAll(source, target);
+  }
+  return translated;
+}
+
+function localTranslate(text, targetLanguage) {
+  const languageLabel = { "zh-CN": "简体中文", en: "English", ja: "日本語", ko: "한국어" }[targetLanguage] || targetLanguage;
+  return `> 未配置可用的远程翻译服务，以下内容仅使用本地术语表替换（${languageLabel}），不是完整翻译。\n\n${localGlossaryReplace(text, targetLanguage)}`;
+}
+
+function splitForTranslation(text, maxLength = 4200) {
+  if (text.length <= maxLength) return [text];
+
+  const chunks = [];
+  let remaining = text;
+  while (remaining.length > maxLength) {
+    let index = remaining.lastIndexOf("\n\n", maxLength);
+    if (index < maxLength * 0.45) index = remaining.lastIndexOf("\n", maxLength);
+    if (index < maxLength * 0.45) index = remaining.lastIndexOf(". ", maxLength);
+    if (index < maxLength * 0.45) index = maxLength;
+    chunks.push(remaining.slice(0, index).trimEnd());
+    remaining = remaining.slice(index).trimStart();
+  }
+  if (remaining) chunks.push(remaining);
+  return chunks;
+}
+
+function normalizeFreeLanguage(language) {
+  const map = {
+    "zh-CN": "zh-CN",
+    zh: "zh-CN",
+    en: "en",
+    ja: "ja",
+    ko: "ko"
+  };
+  return map[language] || language;
+}
+
+async function googleFreeTranslate(text, targetLanguage, sourceLanguage) {
+  const chunks = splitForTranslation(text);
+  const translatedChunks = [];
+  for (const chunk of chunks) {
+    const url = new URL("https://translate.googleapis.com/translate_a/single");
+    url.searchParams.set("client", "gtx");
+    url.searchParams.set("sl", sourceLanguage === "auto" ? "auto" : normalizeFreeLanguage(sourceLanguage));
+    url.searchParams.set("tl", normalizeFreeLanguage(targetLanguage));
+    url.searchParams.set("dt", "t");
+    url.searchParams.set("q", chunk);
+    const data = await fetchGoogleFreeJson(url);
+    const translated = data?.[0]?.map((part) => part?.[0] || "").join("");
+    if (!translated) throw new Error("Google free translate returned an empty result.");
+    translatedChunks.push(translated);
+  }
+  return translatedChunks.join("\n\n");
+}
+
+async function fetchGoogleFreeJson(url) {
+  if (googleFetchMode === "powershell") {
+    return fetchGoogleFreeJsonWithPowerShell(url);
+  }
+  try {
+    const response = await fetch(url, { signal: AbortSignal.timeout(1500) });
+    if (!response.ok) throw new Error(`Google free translate returned ${response.status}`);
+    return await response.json();
+  } catch (error) {
+    if (process.platform !== "win32") throw error;
+    googleFetchMode = "powershell";
+    return fetchGoogleFreeJsonWithPowerShell(url);
+  }
+}
+
+async function fetchGoogleFreeJsonWithPowerShell(url) {
+  const { stdout } = await execFileAsync(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-Command",
+      "[Console]::OutputEncoding=[Text.UTF8Encoding]::UTF8; $u=$env:REPO_VIEWER_TRANSLATE_URL; (Invoke-WebRequest -Uri $u -TimeoutSec 20 -UseBasicParsing).Content"
+    ],
+    {
+      timeout: 25000,
+      windowsHide: true,
+      maxBuffer: 1024 * 1024 * 8,
+      env: { ...process.env, REPO_VIEWER_TRANSLATE_URL: String(url) }
+    }
+  );
+  return JSON.parse(stdout);
+}
+
+async function myMemoryTranslate(text, targetLanguage, sourceLanguage) {
+  const chunks = splitForTranslation(text, 450);
+  const translatedChunks = [];
+  const source = sourceLanguage === "auto" ? "en" : normalizeFreeLanguage(sourceLanguage);
+  const target = normalizeFreeLanguage(targetLanguage);
+  for (const chunk of chunks) {
+    const url = new URL("https://api.mymemory.translated.net/get");
+    url.searchParams.set("q", chunk);
+    url.searchParams.set("langpair", `${source}|${target}`);
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`MyMemory translate returned ${response.status}`);
+    const data = await response.json();
+    const translated = data?.responseData?.translatedText;
+    if (!translated) throw new Error("MyMemory translate returned an empty result.");
+    translatedChunks.push(translated);
+  }
+  return translatedChunks.join("\n\n");
+}
+
+async function remoteTranslate(text, targetLanguage, sourceLanguage) {
+  const provider = process.env.TRANSLATE_PROVIDER || "generic";
+  if (provider === "google-free") {
+    try {
+      return await googleFreeTranslate(text, targetLanguage, sourceLanguage);
+    } catch (error) {
+      return myMemoryTranslate(text, targetLanguage, sourceLanguage);
+    }
+  }
+  if (provider === "mymemory-free") return myMemoryTranslate(text, targetLanguage, sourceLanguage);
+
+  const endpoint = process.env.TRANSLATE_ENDPOINT;
+  if (!endpoint) return null;
+  const apiKey = process.env.TRANSLATE_API_KEY;
+  const headers = {
+    "content-type": "application/json",
+    ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {})
+  };
+
+  if (provider === "openai-compatible") {
+    const model = process.env.TRANSLATE_MODEL;
+    if (!model) throw new Error("TRANSLATE_MODEL is required for openai-compatible provider.");
+
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model,
+        temperature: 0.1,
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a precise software documentation translator. Preserve Markdown, code blocks, inline code, links, paths, identifiers, commands, and frontmatter exactly. Return only the translated content."
+          },
+          {
+            role: "user",
+            content: `Translate from ${sourceLanguage} to ${targetLanguage}:\n\n${text}`
+          }
+        ]
+      })
+    });
+    if (!response.ok) throw new Error(`OpenAI-compatible endpoint returned ${response.status}`);
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content || null;
+  }
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      text,
+      targetLanguage,
+      sourceLanguage,
+      preserveMarkdown: true,
+      preserveCodeBlocks: true
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`Translation endpoint returned ${response.status}`);
+  }
+
+  const data = await response.json();
+  return data.translation || data.translatedText || data.text || null;
+}
+
+function translationConfig() {
+  const endpoint = process.env.TRANSLATE_ENDPOINT || "";
+  const provider = process.env.TRANSLATE_PROVIDER || "generic";
+  const freeProvider = provider === "google-free" || provider === "mymemory-free";
+  return {
+    remoteConfigured: freeProvider || Boolean(endpoint && (provider !== "openai-compatible" || process.env.TRANSLATE_MODEL)),
+    endpointConfigured: Boolean(endpoint),
+    apiKeyConfigured: Boolean(process.env.TRANSLATE_API_KEY),
+    provider,
+    endpoint,
+    model: process.env.TRANSLATE_MODEL || "",
+    repositoryTranslations: true,
+    localFallback: true
+  };
+}
+
+function handleTranslationStatus(response) {
+  sendJson(response, 200, translationConfig());
+}
+
+function serializeEnvValue(value) {
+  const stringValue = String(value || "");
+  if (!stringValue || /^[A-Za-z0-9_./:?-]+$/.test(stringValue)) return stringValue;
+  return JSON.stringify(stringValue);
+}
+
+async function saveTranslationConfig(config) {
+  const allowedProviders = new Set(["generic", "openai-compatible", "google-free", "mymemory-free"]);
+  const provider = allowedProviders.has(config.provider) ? config.provider : "generic";
+  const isFreeProvider = provider === "google-free" || provider === "mymemory-free";
+  const endpoint = isFreeProvider ? "" : String(config.endpoint || "").trim();
+  const model = provider === "openai-compatible" ? String(config.model || "").trim() : "";
+  const apiKey = String(config.apiKey || "").trim();
+
+  process.env.TRANSLATE_PROVIDER = provider;
+  process.env.TRANSLATE_ENDPOINT = endpoint;
+  process.env.TRANSLATE_MODEL = model;
+  if (apiKey) {
+    process.env.TRANSLATE_API_KEY = apiKey;
+  } else if (isFreeProvider || config.clearApiKey) {
+    delete process.env.TRANSLATE_API_KEY;
+  }
+
+  const lines = [
+    "# Saved by Repo Viewer. Do not commit this file.",
+    `TRANSLATE_PROVIDER=${serializeEnvValue(process.env.TRANSLATE_PROVIDER)}`,
+    `TRANSLATE_ENDPOINT=${serializeEnvValue(process.env.TRANSLATE_ENDPOINT)}`,
+    `TRANSLATE_MODEL=${serializeEnvValue(process.env.TRANSLATE_MODEL)}`,
+    `TRANSLATE_API_KEY=${serializeEnvValue(process.env.TRANSLATE_API_KEY || "")}`
+  ];
+  await writeFile(join(projectRoot, ".env"), `${lines.join("\n")}\n`, "utf8");
+  translationCache.clear();
+  return translationConfig();
+}
+
+async function handleSaveTranslationConfig(request, response) {
+  let payload = "";
+  for await (const chunk of request) {
+    payload += chunk;
+    if (payload.length > 64 * 1024) {
+      sendError(response, 413, "Translation config payload is too large.");
+      return;
+    }
+  }
+  const body = JSON.parse(payload || "{}");
+  const config = await saveTranslationConfig(body);
+  sendJson(response, 200, config);
+}
+
+async function handleTranslate(request, response) {
+  let payload = "";
+  for await (const chunk of request) {
+    payload += chunk;
+    if (payload.length > maxTextBytes * 2) {
+      sendError(response, 413, "Translation payload is too large.");
+      return;
+    }
+  }
+
+  const body = JSON.parse(payload || "{}");
+  const text = String(body.text || "");
+  const targetLanguage = String(body.targetLanguage || "zh-CN");
+  const sourceLanguage = String(body.sourceLanguage || "auto");
+  const sourcePath = String(body.path || "");
+  const root = body.root ? safeRoot(String(body.root)) : null;
+  const key = createHash("sha256").update(`${targetLanguage}:${sourceLanguage}:${sourcePath}:${text}`).digest("hex");
+
+  if (translationCache.has(key)) {
+    sendJson(response, 200, { ...translationCache.get(key), cached: true });
+    return;
+  }
+
+  const repositoryTranslation = await findRepositoryTranslation(root, sourcePath, targetLanguage);
+  if (repositoryTranslation) {
+    const result = {
+      translatedText: repositoryTranslation.translatedText,
+      targetLanguage,
+      sourceLanguage,
+      provider: "repository",
+      sourcePath: repositoryTranslation.candidatePath
+    };
+    translationCache.set(key, result);
+    sendJson(response, 200, result);
+    return;
+  }
+
+  let provider = "local";
+  let translated = null;
+  let fallbackReason = "";
+
+  if (!shouldTranslateFile(body)) {
+    const result = {
+      translatedText: "该文件被识别为代码或结构化配置文件，已跳过自动翻译。代码内容请查看原文。",
+      targetLanguage,
+      sourceLanguage,
+      provider: "skipped-code",
+      fallbackReason: ""
+    };
+    translationCache.set(key, result);
+    sendJson(response, 200, result);
+    return;
+  }
+
+  try {
+    translated = await translateMarkdownWithoutCode(text, targetLanguage, sourceLanguage);
+    if (translated) provider = process.env.TRANSLATE_PROVIDER || "remote";
+  } catch (error) {
+    translated = null;
+    fallbackReason = error.message || "Remote translation failed.";
+  }
+
+  if (!translated) {
+    const configuredProvider = process.env.TRANSLATE_PROVIDER || "generic";
+    if (!process.env.TRANSLATE_ENDPOINT && configuredProvider !== "google-free" && configuredProvider !== "mymemory-free") {
+      fallbackReason = "TRANSLATE_ENDPOINT is not configured.";
+    }
+    translated = localTranslateMarkdownWithoutCode(text, targetLanguage);
+  }
+
+  const result = {
+    translatedText: translated,
+    targetLanguage,
+    sourceLanguage,
+    provider,
+    fallbackReason
+  };
+  translationCache.set(key, result);
+  sendJson(response, 200, result);
+}
+
+async function serveStatic(requestUrl, response) {
+  const pathname = requestUrl.pathname === "/" ? "/index.html" : decodeURIComponent(requestUrl.pathname);
+  const absolutePath = resolve(staticRoot, `.${pathname}`);
+  const relativePath = relative(staticRoot, absolutePath);
+
+  if (relativePath.startsWith("..") || relativePath === "..") {
+    sendError(response, 403, "Forbidden.");
+    return;
+  }
+
+  if (!existsSync(absolutePath)) {
+    sendError(response, 404, "Not found.");
+    return;
+  }
+
+  const extension = extname(absolutePath).toLowerCase();
+  const fileStats = await stat(absolutePath);
+  response.writeHead(200, {
+    "content-type": mimeTypes.get(extension) || "application/octet-stream",
+    "content-length": fileStats.size
+  });
+  createReadStream(absolutePath).pipe(response);
+}
+
+async function handleRequest(request, response) {
+  const requestUrl = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+
+  try {
+    if (request.method === "GET" && requestUrl.pathname === "/api/tree") {
+      await handleTree(requestUrl, response);
+      return;
+    }
+    if (request.method === "GET" && requestUrl.pathname === "/api/file") {
+      await handleFile(requestUrl, response);
+      return;
+    }
+    if (request.method === "GET" && requestUrl.pathname === "/api/raw") {
+      await handleRaw(requestUrl, response);
+      return;
+    }
+    if (request.method === "POST" && requestUrl.pathname === "/api/translate") {
+      await handleTranslate(request, response);
+      return;
+    }
+    if (request.method === "GET" && requestUrl.pathname === "/api/translation-status") {
+      handleTranslationStatus(response);
+      return;
+    }
+    if (request.method === "POST" && requestUrl.pathname === "/api/translation-config") {
+      await handleSaveTranslationConfig(request, response);
+      return;
+    }
+    if (request.method === "GET") {
+      await serveStatic(requestUrl, response);
+      return;
+    }
+    sendError(response, 405, "Method not allowed.");
+  } catch (error) {
+    sendError(response, error.statusCode || 500, error.message || "Unexpected server error.");
+  }
+}
+
+async function runCheck() {
+  const root = safeRoot(process.env.REPO_ROOT || defaultRepoRoot);
+  const children = await readDirectoryLevel(root, root);
+  if (!children.length) {
+    throw new Error("Tree scan returned no entries.");
+  }
+  const readmePath = join(root, "README.md");
+  if (existsSync(readmePath)) {
+    const content = await readFile(readmePath, "utf8");
+    if (!content.trim()) {
+      throw new Error("README.md is empty.");
+    }
+  }
+  console.log(`check ok: scanned root directory with ${children.length} entries from ${root}`);
+}
+
+if (process.argv.includes("--check")) {
+  runCheck().catch((error) => {
+    console.error(error.message);
+    process.exitCode = 1;
+  });
+} else {
+  createServer(handleRequest).listen(port, () => {
+    console.log(`Repo Viewer running at http://localhost:${port}`);
+    console.log(`Default repository: ${defaultRepoRoot}`);
+  });
+}

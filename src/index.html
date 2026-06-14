@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Repo Viewer</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark">RV</span>
+          <div>
+            <h1>Repo Viewer</h1>
+            <p id="repoMeta">正在读取本地仓库</p>
+          </div>
+        </div>
+        <form id="repoForm" class="repo-form">
+          <label for="repoRoot">本地仓库</label>
+          <input id="repoRoot" name="repoRoot" autocomplete="off" />
+          <button type="submit" title="读取仓库">读取</button>
+        </form>
+      </header>
+
+      <main class="workspace">
+        <aside class="sidebar">
+          <div class="panel-head">
+            <div>
+              <span class="eyebrow">File Explorer</span>
+              <h2>文件树</h2>
+            </div>
+            <button id="refreshTree" class="icon-button" title="刷新目录">↻</button>
+          </div>
+          <input id="treeSearch" class="search" placeholder="按路径过滤" />
+          <div id="tree" class="tree" aria-live="polite"></div>
+        </aside>
+
+        <section class="viewer">
+          <div class="viewer-toolbar">
+            <div class="path-block">
+              <span class="eyebrow">Preview</span>
+              <h2 id="fileTitle">选择一个文件</h2>
+              <p id="filePath">点击左侧文件查看内容</p>
+            </div>
+            <div class="toolbar-actions">
+              <select id="targetLanguage" title="目标语言">
+                <option value="zh-CN">简体中文</option>
+                <option value="en">English</option>
+                <option value="ja">日本語</option>
+                <option value="ko">한국어</option>
+              </select>
+              <select id="themeSelect" title="主题">
+                <option value="paper">纸张</option>
+                <option value="light">亮色</option>
+                <option value="dark">暗色</option>
+                <option value="green">护眼</option>
+                <option value="contrast">高对比</option>
+              </select>
+              <div class="segment" role="group" aria-label="预览模式">
+                <button data-view="source" class="active" type="button">原文</button>
+                <button data-view="translated" type="button">译文</button>
+                <button data-view="split" type="button">并排</button>
+              </div>
+              <button id="translateFile" type="button" title="翻译当前文件">翻译</button>
+              <button id="configureTranslation" type="button" title="配置翻译服务">配置</button>
+            </div>
+          </div>
+
+          <div id="translationConfig" class="translation-config">正在检查翻译配置</div>
+          <div id="status" class="status">等待选择文件</div>
+          <div id="preview" class="preview empty">
+            <div class="empty-state">
+              <span>⌘</span>
+              <h3>本地仓库已准备好</h3>
+              <p>展开文件夹，选择 Markdown、代码或图片开始浏览。</p>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <dialog id="translationDialog" class="config-dialog">
+        <form id="translationForm" method="dialog">
+          <div class="dialog-head">
+            <div>
+              <span class="eyebrow">Translation Layer</span>
+              <h2>翻译配置</h2>
+            </div>
+            <button id="closeTranslationDialog" class="icon-button" type="button" title="关闭">×</button>
+          </div>
+          <div class="config-grid">
+            <label>
+              Provider
+              <select id="configProvider" name="provider">
+                <option value="google-free">Google 免费端点 + MyMemory 备用</option>
+                <option value="mymemory-free">MyMemory 免费端点</option>
+                <option value="openai-compatible">OpenAI-compatible</option>
+                <option value="generic">Generic POST</option>
+              </select>
+            </label>
+            <label data-config-field="endpoint">
+              Endpoint
+              <input id="configEndpoint" name="endpoint" placeholder="免费端点可留空；AI/Generic 填接口地址" />
+            </label>
+            <label data-config-field="model">
+              Model
+              <input id="configModel" name="model" placeholder="gpt-4.1-mini / qwen2.5:7b" />
+            </label>
+            <label data-config-field="apiKey">
+              API Key
+              <input id="configApiKey" name="apiKey" type="password" placeholder="留空则保留当前 key" autocomplete="off" />
+            </label>
+            <label class="check-row" data-config-field="apiKey">
+              <input id="clearApiKey" name="clearApiKey" type="checkbox" />
+              清空已保存 API Key
+            </label>
+          </div>
+          <p id="configHint" class="config-hint">Google/MyMemory 免费端点无需 API Key；AI/Generic 配置仍会保留。</p>
+          <div class="dialog-actions">
+            <button id="saveTranslationConfig" type="submit">保存配置</button>
+          </div>
+        </form>
+      </dialog>
+    </div>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
