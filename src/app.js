@@ -380,6 +380,21 @@ function renderPane(title, content, file) {
   return `<section class="pane"><div class="pane-title"><span>${title}</span><span>${file?.language || "Text"}</span></div>${body}</section>`;
 }
 
+function translationPaneTitle(file) {
+  const hasTranslation = state.translation?.sourcePath === file.path;
+  if (!hasTranslation) return "Translated";
+  if (state.translation.provider === "skipped-code") return "Translated · 原文保留";
+  return `Translated · ${state.translation.provider}`;
+}
+
+function keepOriginalInTranslationPane(file) {
+  state.translation = {
+    translatedText: file.content,
+    provider: "skipped-code",
+    sourcePath: file.path
+  };
+}
+
 function renderLoadingPane(file) {
   return `<section class="pane loading-pane">
     <div class="pane-title"><span>Translated · loading</span><span>${file?.language || "Text"}</span></div>
@@ -413,18 +428,19 @@ function renderPreview() {
 
   const hasTranslation = state.translation?.sourcePath === file.path;
   const translatedText = hasTranslation ? state.translation.translatedText : "尚未翻译。点击右上角“翻译”生成目标语言内容。";
+  const translatedTitle = translationPaneTitle(file);
   const gridClass = state.viewMode === "split" ? "preview-grid split" : "preview-grid";
 
   let panes = "";
   if (state.viewMode === "source") {
     panes = renderPane("Source", file.content, file);
   } else if (state.viewMode === "translated") {
-    panes = state.translationLoading ? renderLoadingPane(file) : renderPane(hasTranslation ? `Translated · ${state.translation.provider}` : "Translated", translatedText, file);
+    panes = state.translationLoading ? renderLoadingPane(file) : renderPane(translatedTitle, translatedText, file);
   } else {
     panes = `${renderPane("Source", file.content, file)}${
       state.translationLoading
         ? renderLoadingPane(file)
-        : renderPane(hasTranslation ? `Translated · ${state.translation.provider}` : "Translated", translatedText, file)
+        : renderPane(translatedTitle, translatedText, file)
     }`;
   }
 
@@ -452,7 +468,11 @@ async function selectFile(path) {
       renderPreview();
       await translateCurrentFile({ automatic: true });
     } else if (file.isCode) {
-      setStatus("代码文件已载入，已跳过自动翻译");
+      keepOriginalInTranslationPane(file);
+      state.viewMode = "split";
+      updateViewButtons();
+      setStatus("代码内容已原样显示，未进行翻译");
+      renderPreview();
     }
   } catch (error) {
     setStatus(error.message, "error");
@@ -484,14 +504,10 @@ async function translateCurrentFile(options = {}) {
     return;
   }
   if (!file.translatable || file.isCode) {
-    state.translation = {
-      translatedText: "该文件被识别为代码或结构化配置文件，已跳过自动翻译。代码内容请查看原文。",
-      provider: "skipped-code",
-      sourcePath: file.path
-    };
+    keepOriginalInTranslationPane(file);
     state.viewMode = "split";
     updateViewButtons();
-    setStatus("代码文件已跳过翻译");
+    setStatus("代码内容已原样显示，未进行翻译");
     renderPreview();
     return;
   }

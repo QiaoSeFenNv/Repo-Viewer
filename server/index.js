@@ -411,25 +411,48 @@ function splitMarkdownForTranslation(markdown) {
   return parts;
 }
 
-async function translateMarkdownWithoutCode(markdown, targetLanguage, sourceLanguage) {
-  const protectedBlocks = [];
-  const protectedText = markdown.replace(/```[\s\S]*?```|`[^`\n]+`/g, (block) => {
-    const token = `ZXCVREPOVIEWERCODE${protectedBlocks.length}ZXCV`;
-    protectedBlocks.push(block);
-    return token;
+function translationConcurrency() {
+  const configured = Number(process.env.TRANSLATE_CONCURRENCY || 3);
+  if (!Number.isFinite(configured)) return 3;
+  return Math.max(1, Math.min(4, Math.floor(configured)));
+}
+
+async function mapWithConcurrency(items, limit, mapper) {
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      await mapper(items[currentIndex], currentIndex);
+    }
   });
-  const translatedChunks = [];
-  for (const chunk of splitForTranslation(protectedText)) {
-    const leading = chunk.match(/^\s*/)?.[0] || "";
-    const trailing = chunk.match(/\s*$/)?.[0] || "";
-    const core = chunk.slice(leading.length, chunk.length - trailing.length);
+  await Promise.all(workers);
+}
+
+async function translateMarkdownWithoutCode(markdown, targetLanguage, sourceLanguage) {
+  const parts = splitMarkdownForTranslation(markdown);
+  const translatedParts = new Array(parts.length);
+
+  await mapWithConcurrency(parts, translationConcurrency(), async (part, index) => {
+    if (part.type === "code") {
+      translatedParts[index] = part.value;
+      return;
+    }
+
+    const leading = part.value.match(/^\s*/)?.[0] || "";
+    const trailing = part.value.match(/\s*$/)?.[0] || "";
+    const core = part.value.slice(leading.length, part.value.length - trailing.length);
+    if (!core) {
+      translatedParts[index] = part.value;
+      return;
+    }
+
     const translated = await remoteTranslate(core, targetLanguage, sourceLanguage);
     if (!translated) throw new Error("Translation provider is not configured.");
-    translatedChunks.push(`${leading}${translated}${trailing}`);
-  }
-  return translatedChunks
-    .join("\n\n")
-    .replace(/ZXCVREPOVIEWERCODE(\d+)ZXCV/g, (_match, index) => protectedBlocks[Number(index)] || "");
+    translatedParts[index] = `${leading}${translated}${trailing}`;
+  });
+
+  return translatedParts.join("");
 }
 
 function localTranslateMarkdownWithoutCode(markdown, targetLanguage) {
@@ -871,11 +894,11 @@ async function handleTranslate(request, response) {
 
   if (!shouldTranslateFile(body)) {
     const result = {
-      translatedText: "该文件被识别为代码或结构化配置文件，已跳过自动翻译。代码内容请查看原文。",
+      translatedText: text,
       targetLanguage,
       sourceLanguage,
       provider: "skipped-code",
-      fallbackReason: ""
+      fallbackReason: "代码或结构化配置文件未送入翻译，已原样显示。"
     };
     translationCache.set(key, result);
     sendJson(response, 200, result);
