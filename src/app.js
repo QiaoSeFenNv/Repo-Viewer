@@ -28,11 +28,8 @@ const elements = {
   translationForm: document.querySelector("#translationForm"),
   closeTranslationDialog: document.querySelector("#closeTranslationDialog"),
   configProvider: document.querySelector("#configProvider"),
-  configEndpoint: document.querySelector("#configEndpoint"),
-  configModel: document.querySelector("#configModel"),
-  configApiKey: document.querySelector("#configApiKey"),
-  clearApiKey: document.querySelector("#clearApiKey"),
-  configFields: document.querySelectorAll("[data-config-field]"),
+  configProxyEnabled: document.querySelector("#configProxyEnabled"),
+  configProxyUrl: document.querySelector("#configProxyUrl"),
   configHint: document.querySelector("#configHint"),
   preview: document.querySelector("#preview"),
   targetLanguage: document.querySelector("#targetLanguage"),
@@ -80,9 +77,9 @@ async function loadTranslationConfig() {
     const config = await apiGet("/api/translation-status");
     state.translationConfig = config;
     if (config.remoteConfigured) {
-      const model = config.model ? ` · ${config.model}` : "";
+      const proxy = config.proxy?.enabled ? ` · 代理 ${config.proxy.url}` : " · 直连";
       elements.translationConfig.className = "translation-config";
-      elements.translationConfig.textContent = `翻译源已配置：${config.provider}${model} · 仓库内译文优先`;
+      elements.translationConfig.textContent = `翻译源已配置：${config.provider}${proxy} · 仓库内译文优先`;
     } else {
       elements.translationConfig.className = "translation-config warning";
       elements.translationConfig.textContent = "翻译源未配置：仅可使用仓库内译文；无对应译文时会使用本地术语表 fallback";
@@ -96,34 +93,17 @@ async function loadTranslationConfig() {
 function fillTranslationForm() {
   const config = state.translationConfig || {};
   elements.configProvider.value = config.provider || "google-free";
-  elements.configEndpoint.value = config.endpoint || "";
-  elements.configModel.value = config.model || "";
-  elements.configApiKey.value = "";
-  elements.clearApiKey.checked = false;
+  elements.configProxyEnabled.checked = config.proxy?.enabled !== false;
+  elements.configProxyUrl.value = config.proxy?.url || "http://127.0.0.1:7897";
   updateTranslationFormFields();
 }
 
 function updateTranslationFormFields() {
   const provider = elements.configProvider.value;
-  const isFreeProvider = provider === "google-free" || provider === "mymemory-free";
-  const isOpenAiProvider = provider === "openai-compatible";
-  elements.configFields.forEach((field) => {
-    const fieldType = field.dataset.configField;
-    const visible = !isFreeProvider && (fieldType !== "model" || isOpenAiProvider);
-    field.classList.toggle("is-hidden", !visible);
-  });
-
   if (provider === "google-free") {
     elements.configHint.textContent = "Google 免费端点无需 API Key；如果 Google 超时或限流，会自动切到 MyMemory。";
-  } else if (provider === "mymemory-free") {
-    elements.configHint.textContent = "MyMemory 免费端点无需 API Key，适合短文本，长文会自动分块。";
-  } else if (provider === "generic") {
-    elements.configHint.textContent = "Generic POST 只需要 Endpoint；请求体会包含 text、targetLanguage、sourceLanguage。";
   } else {
-    const config = state.translationConfig || {};
-    elements.configHint.textContent = config.apiKeyConfigured
-      ? "已保存 API Key。留空会继续保留；勾选清空可移除。"
-      : "尚未保存 API Key。API Key 只写入本地 .env，不会回显。";
+    elements.configHint.textContent = "MyMemory 免费端点无需 API Key，适合短文本，长文会自动分块。";
   }
 }
 
@@ -140,14 +120,11 @@ async function saveTranslationConfig(event) {
   event.preventDefault();
   elements.configHint.textContent = "正在保存配置";
   const provider = elements.configProvider.value;
-  const isFreeProvider = provider === "google-free" || provider === "mymemory-free";
   try {
     const config = await apiPost("/api/translation-config", {
       provider,
-      endpoint: isFreeProvider ? "" : elements.configEndpoint.value,
-      model: provider === "openai-compatible" ? elements.configModel.value : "",
-      apiKey: isFreeProvider ? "" : elements.configApiKey.value,
-      clearApiKey: isFreeProvider || elements.clearApiKey.checked
+      proxyEnabled: elements.configProxyEnabled.checked,
+      proxyUrl: elements.configProxyUrl.value
     });
     state.translationConfig = config;
     closeTranslationDialog();
@@ -536,11 +513,9 @@ async function translateCurrentFile(options = {}) {
         : data.provider === "google-free"
           ? "Google 免费翻译"
           : data.provider === "mymemory-free"
-            ? "MyMemory 免费翻译"
-            : data.provider === "openai-compatible" || data.provider === "generic"
-              ? "远程翻译端点"
-              : data.provider === "skipped-code"
-                ? "已跳过代码翻译"
+          ? "MyMemory 免费翻译"
+            : data.provider === "skipped-code"
+              ? "已跳过代码翻译"
               : "本地 fallback";
     const reason = data.fallbackReason ? ` · 原因：${data.fallbackReason}` : "";
     setStatus(`翻译完成：${providerLabel}${reason}${data.cached ? " · cached" : ""}`);

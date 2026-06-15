@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
-import { execFile } from "node:child_process";
 import { createReadStream, existsSync } from "node:fs";
 import { lstat, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
+import { connect as netConnect } from "node:net";
 import { extname, join, relative, resolve, sep } from "node:path";
-import { promisify } from "node:util";
+import { connect as tlsConnect } from "node:tls";
 import { fileURLToPath } from "node:url";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
@@ -12,7 +12,6 @@ const projectRoot = resolve(__dirname, "..");
 const staticRoot = join(projectRoot, "src");
 const defaultRepoRoot = resolve(process.env.REPO_ROOT || process.cwd());
 const envPath = resolve(process.env.REPO_VIEWER_ENV_PATH || join(projectRoot, ".env"));
-const execFileAsync = promisify(execFile);
 
 async function loadEnvFile() {
   if (!existsSync(envPath)) return;
@@ -40,7 +39,7 @@ const maxTreeEntries = Number(process.env.MAX_TREE_ENTRIES || 12000);
 const defaultTranslateProvider = "google-free";
 const translateTimeoutMs = Number(process.env.TRANSLATE_TIMEOUT_MS || 20000);
 const translateLogEnabled = process.env.TRANSLATE_LOG !== "0" && process.env.REPO_VIEWER_TRANSLATE_LOG !== "0";
-let windowsProxyConfigPromise = null;
+const defaultTranslateProxyUrl = "http://127.0.0.1:7897";
 
 const ignoredNames = new Set([
   ".git",
@@ -420,6 +419,18 @@ function translationConcurrency() {
   return Math.max(1, Math.min(4, Math.floor(configured)));
 }
 
+function translationBatchMaxChars() {
+  const configured = Number(process.env.TRANSLATE_BATCH_CHARS || 3200);
+  if (!Number.isFinite(configured)) return 3200;
+  return Math.max(800, Math.min(12000, Math.floor(configured)));
+}
+
+function translationBatchMaxItems() {
+  const configured = Number(process.env.TRANSLATE_BATCH_ITEMS || 24);
+  if (!Number.isFinite(configured)) return 24;
+  return Math.max(2, Math.min(80, Math.floor(configured)));
+}
+
 async function mapWithConcurrency(items, limit, mapper) {
   let nextIndex = 0;
   const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
@@ -432,14 +443,77 @@ async function mapWithConcurrency(items, limit, mapper) {
   await Promise.all(workers);
 }
 
+function buildTranslationBatches(items) {
+  const batches = [];
+  const maxChars = translationBatchMaxChars();
+  const maxItems = translationBatchMaxItems();
+  let current = [];
+  let currentLength = 0;
+
+  for (const item of items) {
+    const delimiterOverhead = current.length ? 38 : 0;
+    const nextLength = currentLength + delimiterOverhead + item.core.length;
+    if (current.length && (current.length >= maxItems || nextLength > maxChars)) {
+      batches.push(current);
+      current = [];
+      currentLength = 0;
+    }
+    current.push(item);
+    currentLength += (current.length > 1 ? delimiterOverhead : 0) + item.core.length;
+  }
+
+  if (current.length) batches.push(current);
+  return batches;
+}
+
+async function translateBatch(batch, targetLanguage, sourceLanguage, batchIndex) {
+  if (batch.length === 1) {
+    const item = batch[0];
+    const translated = await remoteTranslate(item.core, targetLanguage, sourceLanguage);
+    if (!translated) throw new Error("Translation provider is not configured.");
+    item.apply(translated);
+    return;
+  }
+
+  const markers = batch.slice(1).map((_, index) => `REPO_VIEWER_TRANSLATE_PART_${batchIndex}_${index}`);
+  const body = batch.map((item, index) => (index === 0 ? item.core : `<<<${markers[index - 1]}>>>\n${item.core}`)).join("\n");
+  const translated = await remoteTranslate(body, targetLanguage, sourceLanguage);
+  if (!translated) throw new Error("Translation provider is not configured.");
+
+  let remaining = translated;
+  const pieces = [];
+  for (const marker of markers) {
+    const markerPattern = new RegExp(`<+\\s*${marker}\\s*>+`);
+    const markerMatch = remaining.match(markerPattern);
+    const markerIndex = markerMatch?.index ?? -1;
+    if (markerIndex < 0) {
+      translateLog("batch-split-fallback", { batch: batchIndex + 1, items: batch.length, missing: marker });
+      await mapWithConcurrency(batch, translationConcurrency(), async (item) => {
+        const part = await remoteTranslate(item.core, targetLanguage, sourceLanguage);
+        if (!part) throw new Error("Translation provider is not configured.");
+        item.apply(part);
+      });
+      return;
+    }
+    pieces.push(remaining.slice(0, markerIndex));
+    remaining = remaining.slice(markerIndex + markerMatch[0].length);
+  }
+  pieces.push(remaining);
+
+  for (const [index, item] of batch.entries()) {
+    item.apply(pieces[index].trim());
+  }
+}
+
 async function translateMarkdownWithoutCode(markdown, targetLanguage, sourceLanguage) {
   const parts = splitMarkdownForTranslation(markdown);
   const translatedParts = new Array(parts.length);
+  const items = [];
 
-  await mapWithConcurrency(parts, translationConcurrency(), async (part, index) => {
+  for (const [index, part] of parts.entries()) {
     if (part.type === "code") {
       translatedParts[index] = part.value;
-      return;
+      continue;
     }
 
     const leading = part.value.match(/^\s*/)?.[0] || "";
@@ -447,12 +521,34 @@ async function translateMarkdownWithoutCode(markdown, targetLanguage, sourceLang
     const core = part.value.slice(leading.length, part.value.length - trailing.length);
     if (!core) {
       translatedParts[index] = part.value;
-      return;
+      continue;
     }
 
-    const translated = await remoteTranslate(core, targetLanguage, sourceLanguage);
-    if (!translated) throw new Error("Translation provider is not configured.");
-    translatedParts[index] = `${leading}${translated}${trailing}`;
+    items.push({
+      core,
+      apply: (translated) => {
+        translatedParts[index] = `${leading}${translated}${trailing}`;
+      }
+    });
+  }
+
+  const batches = buildTranslationBatches(items);
+  translateLog("request-plan", {
+    parts: parts.length,
+    textItems: items.length,
+    batches: batches.length,
+    batchChars: translationBatchMaxChars(),
+    batchItems: translationBatchMaxItems()
+  });
+
+  await mapWithConcurrency(batches, translationConcurrency(), async (batch, index) => {
+    translateLog("batch-start", {
+      batch: `${index + 1}/${batches.length}`,
+      items: batch.length,
+      chars: batch.reduce((sum, item) => sum + item.core.length, 0)
+    });
+    await translateBatch(batch, targetLanguage, sourceLanguage, index);
+    translateLog("batch-ok", { batch: `${index + 1}/${batches.length}` });
   });
 
   return translatedParts.join("");
@@ -684,156 +780,298 @@ function normalizeProxyUrl(value) {
   return `http://${proxy}`;
 }
 
-function envProxyForUrl(targetUrl) {
-  const protocol = new URL(String(targetUrl)).protocol;
-  const candidates =
-    protocol === "https:"
-      ? ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"]
-      : ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
-  for (const name of candidates) {
-    const value = process.env[name];
-    if (value) {
-      return {
-        source: process.platform === "win32" ? name : `${name}-unsupported`,
-        url: process.platform === "win32" ? normalizeProxyUrl(value) : "",
-        usePowerShell: process.platform === "win32"
-      };
-    }
-  }
-  return null;
+function parseBoolean(value, defaultValue) {
+  if (value === undefined || value === null || value === "") return defaultValue;
+  return !["0", "false", "off", "no"].includes(String(value).trim().toLowerCase());
 }
 
-function selectWindowsProxy(proxyServer, protocol) {
-  const raw = String(proxyServer || "").trim();
-  if (!raw) return "";
-  if (!raw.includes("=")) return normalizeProxyUrl(raw.split(";")[0]);
-
-  const entries = new Map();
-  for (const part of raw.split(";")) {
-    const separator = part.indexOf("=");
-    if (separator < 1) continue;
-    entries.set(part.slice(0, separator).trim().toLowerCase(), part.slice(separator + 1).trim());
-  }
-
-  const key = protocol.replace(":", "").toLowerCase();
-  return normalizeProxyUrl(entries.get(key) || entries.get("http") || entries.values().next().value || "");
+function proxyConfig() {
+  const enabled = parseBoolean(process.env.TRANSLATE_PROXY_ENABLED, true);
+  const url = normalizeProxyUrl(process.env.TRANSLATE_PROXY_URL || defaultTranslateProxyUrl);
+  return { enabled, url };
 }
 
-async function windowsProxyConfig() {
-  if (process.platform !== "win32" || process.env.REPO_VIEWER_DISABLE_SYSTEM_PROXY === "1") return null;
-  if (!windowsProxyConfigPromise) {
-    windowsProxyConfigPromise = execFileAsync(
-      "powershell.exe",
-      [
-        "-NoProfile",
-        "-Command",
-        [
-          "$p=Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings';",
-          "[Console]::OutputEncoding=[Text.UTF8Encoding]::UTF8;",
-          "[pscustomobject]@{ProxyEnable=$p.ProxyEnable;ProxyServer=$p.ProxyServer;AutoConfigURL=$p.AutoConfigURL}|ConvertTo-Json -Compress"
-        ].join(" ")
-      ],
-      { timeout: 5000, windowsHide: true, maxBuffer: 1024 * 256 }
-    )
-      .then(({ stdout }) => JSON.parse(stdout || "{}"))
-      .catch((error) => {
-        translateLog("proxy-detect-failed", { error: errorMessage(error) });
-        return null;
-      });
-  }
-  return windowsProxyConfigPromise;
+function proxyForUrl() {
+  const config = proxyConfig();
+  if (!config.enabled || !config.url) return { source: "disabled", url: "" };
+  return { source: "configured", url: config.url };
 }
 
-async function proxyForUrl(targetUrl) {
-  const envProxy = envProxyForUrl(targetUrl);
-  if (envProxy) return envProxy;
-
-  const config = await windowsProxyConfig();
-  if (!config) return { source: "none", url: "", usePowerShell: false };
-
-  const proxyEnabled = Number(config.ProxyEnable) === 1;
-  const proxyUrl = proxyEnabled ? selectWindowsProxy(config.ProxyServer, new URL(String(targetUrl)).protocol) : "";
-  if (proxyUrl) return { source: "windows-system", url: proxyUrl, usePowerShell: true };
-  if (config.AutoConfigURL) return { source: "windows-pac", url: "", usePowerShell: true };
-  return { source: "none", url: "", usePowerShell: false };
+function proxyAuthorization(proxyUrl) {
+  const username = decodeURIComponent(proxyUrl.username || "");
+  const password = decodeURIComponent(proxyUrl.password || "");
+  if (!username && !password) return "";
+  return `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`;
 }
 
-async function fetchJsonWithPowerShell(url, options = {}, proxyInfo = {}) {
-  const headers = options.headers || {};
-  const env = {
-    ...process.env,
-    REPO_VIEWER_REQUEST_URL: String(url),
-    REPO_VIEWER_REQUEST_METHOD: options.method || "GET",
-    REPO_VIEWER_REQUEST_BODY: options.body || "",
-    REPO_VIEWER_REQUEST_CONTENT_TYPE: headers["content-type"] || headers["Content-Type"] || "",
-    REPO_VIEWER_REQUEST_AUTHORIZATION: headers.authorization || headers.Authorization || "",
-    REPO_VIEWER_PROXY_URL: proxyInfo.url || ""
-  };
-  const command = [
-    "[Console]::OutputEncoding=[Text.UTF8Encoding]::UTF8;",
-    "$headers=@{};",
-    "if ($env:REPO_VIEWER_REQUEST_AUTHORIZATION) { $headers['Authorization']=$env:REPO_VIEWER_REQUEST_AUTHORIZATION };",
-    "$params=@{Uri=$env:REPO_VIEWER_REQUEST_URL;Method=$env:REPO_VIEWER_REQUEST_METHOD;TimeoutSec=[Math]::Ceiling($env:REPO_VIEWER_TIMEOUT_MS/1000);UseBasicParsing=$true};",
-    "if ($headers.Count -gt 0) { $params.Headers=$headers };",
-    "if ($env:REPO_VIEWER_REQUEST_BODY) { $params.Body=$env:REPO_VIEWER_REQUEST_BODY; if ($env:REPO_VIEWER_REQUEST_CONTENT_TYPE) { $params.ContentType=$env:REPO_VIEWER_REQUEST_CONTENT_TYPE } else { $params.ContentType='application/json; charset=utf-8' } };",
-    "if ($env:REPO_VIEWER_PROXY_URL) { $params.Proxy=$env:REPO_VIEWER_PROXY_URL };",
-    "(Invoke-WebRequest @params).Content"
-  ].join(" ");
-  const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-Command", command], {
-    timeout: options.timeoutMs || translateTimeoutMs + 5000,
-    windowsHide: true,
-    maxBuffer: 1024 * 1024 * 8,
-    env: { ...env, REPO_VIEWER_TIMEOUT_MS: String(options.timeoutMs || translateTimeoutMs) }
+function openTcpSocket(host, port, timeoutMs) {
+  return new Promise((resolveSocket, rejectSocket) => {
+    const socket = netConnect({ host, port });
+    const cleanup = () => {
+      socket.off("connect", onConnect);
+      socket.off("error", onError);
+      socket.off("timeout", onTimeout);
+    };
+    const onConnect = () => {
+      cleanup();
+      resolveSocket(socket);
+    };
+    const onError = (error) => {
+      cleanup();
+      rejectSocket(error);
+    };
+    const onTimeout = () => {
+      cleanup();
+      socket.destroy();
+      rejectSocket(new Error(`Proxy connection timed out: ${host}:${port}`));
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", onConnect);
+    socket.once("error", onError);
+    socket.once("timeout", onTimeout);
   });
-  return JSON.parse(stdout);
+}
+
+function writeSocket(socket, data) {
+  return new Promise((resolveWrite, rejectWrite) => {
+    socket.write(data, (error) => {
+      if (error) rejectWrite(error);
+      else resolveWrite();
+    });
+  });
+}
+
+function readHeaders(socket, timeoutMs) {
+  return new Promise((resolveHeaders, rejectHeaders) => {
+    let buffer = Buffer.alloc(0);
+    const cleanup = () => {
+      socket.off("data", onData);
+      socket.off("error", onError);
+      socket.off("timeout", onTimeout);
+    };
+    const onData = (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      const headerEnd = buffer.indexOf("\r\n\r\n");
+      if (headerEnd === -1) return;
+      cleanup();
+      socket.pause();
+      resolveHeaders({
+        header: buffer.subarray(0, headerEnd).toString("latin1"),
+        rest: buffer.subarray(headerEnd + 4)
+      });
+    };
+    const onError = (error) => {
+      cleanup();
+      rejectHeaders(error);
+    };
+    const onTimeout = () => {
+      cleanup();
+      socket.destroy();
+      rejectHeaders(new Error("Timed out while reading proxy response."));
+    };
+    socket.setTimeout(timeoutMs);
+    socket.on("data", onData);
+    socket.once("error", onError);
+    socket.once("timeout", onTimeout);
+    socket.resume();
+  });
+}
+
+function connectTlsSocket(socket, servername, timeoutMs) {
+  return new Promise((resolveTls, rejectTls) => {
+    const tlsSocket = tlsConnect({ socket, servername });
+    const cleanup = () => {
+      tlsSocket.off("secureConnect", onConnect);
+      tlsSocket.off("error", onError);
+      tlsSocket.off("timeout", onTimeout);
+    };
+    const onConnect = () => {
+      cleanup();
+      resolveTls(tlsSocket);
+    };
+    const onError = (error) => {
+      cleanup();
+      rejectTls(error);
+    };
+    const onTimeout = () => {
+      cleanup();
+      tlsSocket.destroy();
+      rejectTls(new Error(`TLS connection timed out: ${servername}`));
+    };
+    tlsSocket.setTimeout(timeoutMs);
+    tlsSocket.once("secureConnect", onConnect);
+    tlsSocket.once("error", onError);
+    tlsSocket.once("timeout", onTimeout);
+  });
+}
+
+function readSocketToEnd(socket, initialBuffer, timeoutMs) {
+  return new Promise((resolveRead, rejectRead) => {
+    const chunks = initialBuffer?.length ? [initialBuffer] : [];
+    const cleanup = () => {
+      socket.off("data", onData);
+      socket.off("end", onEnd);
+      socket.off("error", onError);
+      socket.off("timeout", onTimeout);
+    };
+    const onData = (chunk) => chunks.push(chunk);
+    const onEnd = () => {
+      cleanup();
+      resolveRead(Buffer.concat(chunks));
+    };
+    const onError = (error) => {
+      cleanup();
+      rejectRead(error);
+    };
+    const onTimeout = () => {
+      cleanup();
+      socket.destroy();
+      rejectRead(new Error("Timed out while reading response."));
+    };
+    socket.setTimeout(timeoutMs);
+    socket.on("data", onData);
+    socket.once("end", onEnd);
+    socket.once("error", onError);
+    socket.once("timeout", onTimeout);
+    socket.resume();
+  });
+}
+
+function parseHeaderBlock(headerBlock) {
+  const lines = headerBlock.split("\r\n");
+  const statusMatch = lines.shift()?.match(/^HTTP\/\d(?:\.\d)?\s+(\d+)\s*(.*)$/i);
+  const status = Number(statusMatch?.[1] || 0);
+  const statusText = statusMatch?.[2] || "";
+  const headers = {};
+  for (const line of lines) {
+    const separator = line.indexOf(":");
+    if (separator < 0) continue;
+    headers[line.slice(0, separator).trim().toLowerCase()] = line.slice(separator + 1).trim();
+  }
+  return { status, statusText, headers };
+}
+
+function decodeChunkedBody(buffer) {
+  const chunks = [];
+  let offset = 0;
+  while (offset < buffer.length) {
+    const lineEnd = buffer.indexOf("\r\n", offset);
+    if (lineEnd < 0) break;
+    const sizeText = buffer.subarray(offset, lineEnd).toString("latin1").split(";")[0].trim();
+    const size = Number.parseInt(sizeText, 16);
+    if (!Number.isFinite(size)) break;
+    offset = lineEnd + 2;
+    if (size === 0) break;
+    chunks.push(buffer.subarray(offset, offset + size));
+    offset += size + 2;
+  }
+  return Buffer.concat(chunks);
+}
+
+function responseBodyBuffer(headers, body) {
+  if (headers["transfer-encoding"]?.toLowerCase().includes("chunked")) {
+    return decodeChunkedBody(body);
+  }
+  return body;
+}
+
+function buildRequestHeaders(target, options, body, useAbsoluteUrl = false, proxyAuth = "") {
+  const headers = {
+    host: target.host,
+    accept: "application/json",
+    "accept-encoding": "identity",
+    connection: "close",
+    ...(options.headers || {})
+  };
+  if (body) headers["content-length"] = Buffer.byteLength(body);
+  if (proxyAuth) headers["proxy-authorization"] = proxyAuth;
+
+  const path = useAbsoluteUrl ? String(target) : `${target.pathname}${target.search}`;
+  const method = options.method || "GET";
+  const lines = [`${method} ${path || "/"} HTTP/1.1`];
+  for (const [name, value] of Object.entries(headers)) {
+    if (value !== undefined && value !== null && value !== "") lines.push(`${name}: ${value}`);
+  }
+  return `${lines.join("\r\n")}\r\n\r\n`;
+}
+
+async function fetchJsonViaProxy(target, options, proxyInfo) {
+  const proxy = new URL(proxyInfo.url);
+  const proxyHost = proxy.hostname;
+  const proxyPort = Number(proxy.port || (proxy.protocol === "https:" ? 443 : 80));
+  if (proxy.protocol !== "http:") {
+    throw new Error(`Only HTTP proxies are supported: ${redactProxyUrl(proxyInfo.url)}`);
+  }
+
+  const timeoutMs = options.timeoutMs || translateTimeoutMs;
+  let socket = await openTcpSocket(proxyHost, proxyPort, timeoutMs);
+  const body = options.body || "";
+  const proxyAuth = proxyAuthorization(proxy);
+
+  try {
+    if (target.protocol === "https:") {
+      const targetPort = target.port || 443;
+      const connectHeaders = [
+        `CONNECT ${target.hostname}:${targetPort} HTTP/1.1`,
+        `Host: ${target.hostname}:${targetPort}`,
+        "Proxy-Connection: Keep-Alive",
+        proxyAuth ? `Proxy-Authorization: ${proxyAuth}` : ""
+      ]
+        .filter(Boolean)
+        .join("\r\n");
+      const connectRequest = `${connectHeaders}\r\n\r\n`;
+      await writeSocket(socket, connectRequest);
+      const connectResponse = await readHeaders(socket, timeoutMs);
+      const connectStatus = parseHeaderBlock(connectResponse.header);
+      if (connectStatus.status !== 200) {
+        throw new Error(`Proxy CONNECT failed: ${connectStatus.status} ${connectStatus.statusText}`.trim());
+      }
+      socket = await connectTlsSocket(socket, target.hostname, timeoutMs);
+      await writeSocket(socket, `${buildRequestHeaders(target, options, body)}${body}`);
+    } else {
+      await writeSocket(socket, `${buildRequestHeaders(target, options, body, true, proxyAuth)}${body}`);
+    }
+
+    const response = await readHeaders(socket, timeoutMs);
+    const meta = parseHeaderBlock(response.header);
+    const rawBody = await readSocketToEnd(socket, response.rest, timeoutMs);
+    const payload = responseBodyBuffer(meta.headers, rawBody).toString("utf8");
+    if (meta.status < 200 || meta.status >= 300) {
+      throw new Error(`${target.host} returned ${meta.status}`);
+    }
+    return JSON.parse(payload);
+  } finally {
+    socket.destroy();
+  }
 }
 
 async function fetchJson(url, options = {}) {
   const startedAt = Date.now();
   const target = new URL(String(url));
-  const proxyInfo = await proxyForUrl(target);
+  const proxyInfo = proxyForUrl();
   const method = options.method || "GET";
   const proxyLabel = proxyInfo.url ? `${proxyInfo.source}:${redactProxyUrl(proxyInfo.url)}` : proxyInfo.source;
-  const usePowerShell = process.platform === "win32" && (proxyInfo.usePowerShell || proxyInfo.url);
+  const mode = proxyInfo.url ? "configured-proxy" : "node-fetch";
 
-  translateLog("http-start", { method, host: target.host, mode: usePowerShell ? "powershell" : "node-fetch", proxy: proxyLabel });
-
-  if (usePowerShell) {
-    try {
-      const data = await fetchJsonWithPowerShell(url, options, proxyInfo);
-      translateLog("http-ok", { method, host: target.host, mode: "powershell", elapsed: durationSince(startedAt) });
-      return data;
-    } catch (error) {
-      translateLog("http-failed", { method, host: target.host, mode: "powershell", elapsed: durationSince(startedAt), error: errorMessage(error) });
-      throw error;
-    }
-  }
+  translateLog("http-start", { method, host: target.host, mode, proxy: proxyLabel });
 
   try {
-    const response = await fetch(url, {
-      method,
-      headers: options.headers,
-      body: options.body,
-      signal: AbortSignal.timeout(options.timeoutMs || translateTimeoutMs)
-    });
-    if (!response.ok) throw new Error(`${target.host} returned ${response.status}`);
-    const data = await response.json();
-    translateLog("http-ok", { method, host: target.host, mode: "node-fetch", elapsed: durationSince(startedAt) });
+    const data = proxyInfo.url
+      ? await fetchJsonViaProxy(target, options, proxyInfo)
+      : await fetch(url, {
+          method,
+          headers: options.headers,
+          body: options.body,
+          signal: AbortSignal.timeout(options.timeoutMs || translateTimeoutMs)
+        }).then(async (response) => {
+          if (!response.ok) throw new Error(`${target.host} returned ${response.status}`);
+          return response.json();
+        });
+    translateLog("http-ok", { method, host: target.host, mode, elapsed: durationSince(startedAt) });
     return data;
   } catch (error) {
-    if (process.platform !== "win32") {
-      translateLog("http-failed", { method, host: target.host, mode: "node-fetch", elapsed: durationSince(startedAt), error: errorMessage(error) });
-      throw error;
-    }
-    translateLog("http-retry", { method, host: target.host, from: "node-fetch", to: "powershell", error: errorMessage(error) });
-    try {
-      const data = await fetchJsonWithPowerShell(url, options, proxyInfo);
-      translateLog("http-ok", { method, host: target.host, mode: "powershell", elapsed: durationSince(startedAt) });
-      return data;
-    } catch (retryError) {
-      translateLog("http-failed", { method, host: target.host, mode: "powershell", elapsed: durationSince(startedAt), error: errorMessage(retryError) });
-      throw retryError;
-    }
+    translateLog("http-failed", { method, host: target.host, mode, elapsed: durationSince(startedAt), error: errorMessage(error) });
+    throw error;
   }
 }
 
@@ -883,7 +1121,7 @@ async function myMemoryTranslate(text, targetLanguage, sourceLanguage) {
 }
 
 async function remoteTranslate(text, targetLanguage, sourceLanguage) {
-  const provider = process.env.TRANSLATE_PROVIDER || defaultTranslateProvider;
+  const provider = freeTranslateProvider(process.env.TRANSLATE_PROVIDER);
   translateLog("remote-provider", { provider, chars: text.length, target: targetLanguage });
   if (provider === "google-free") {
     try {
@@ -894,69 +1132,19 @@ async function remoteTranslate(text, targetLanguage, sourceLanguage) {
     }
   }
   if (provider === "mymemory-free") return myMemoryTranslate(text, targetLanguage, sourceLanguage);
+}
 
-  const endpoint = process.env.TRANSLATE_ENDPOINT;
-  if (!endpoint) return null;
-  const apiKey = process.env.TRANSLATE_API_KEY;
-  const headers = {
-    "content-type": "application/json",
-    ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {})
-  };
-
-  if (provider === "openai-compatible") {
-    const model = process.env.TRANSLATE_MODEL;
-    if (!model) throw new Error("TRANSLATE_MODEL is required for openai-compatible provider.");
-
-    const data = await fetchJson(endpoint, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        model,
-        temperature: 0.1,
-        messages: [
-          {
-            role: "system",
-            content:
-              "You are a precise software documentation translator. Preserve Markdown, code blocks, inline code, links, paths, identifiers, commands, and frontmatter exactly. Return only the translated content."
-          },
-          {
-            role: "user",
-            content: `Translate from ${sourceLanguage} to ${targetLanguage}:\n\n${text}`
-          }
-        ]
-      }),
-      timeoutMs: translateTimeoutMs
-    });
-    return data.choices?.[0]?.message?.content || null;
-  }
-
-  const data = await fetchJson(endpoint, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      text,
-      targetLanguage,
-      sourceLanguage,
-      preserveMarkdown: true,
-      preserveCodeBlocks: true
-    }),
-    timeoutMs: translateTimeoutMs
-  });
-
-  return data.translation || data.translatedText || data.text || null;
+function freeTranslateProvider(provider) {
+  return provider === "mymemory-free" ? "mymemory-free" : defaultTranslateProvider;
 }
 
 function translationConfig() {
-  const endpoint = process.env.TRANSLATE_ENDPOINT || "";
-  const provider = process.env.TRANSLATE_PROVIDER || defaultTranslateProvider;
-  const freeProvider = provider === "google-free" || provider === "mymemory-free";
+  const provider = freeTranslateProvider(process.env.TRANSLATE_PROVIDER);
+  const proxy = proxyConfig();
   return {
-    remoteConfigured: freeProvider || Boolean(endpoint && (provider !== "openai-compatible" || process.env.TRANSLATE_MODEL)),
-    endpointConfigured: Boolean(endpoint),
-    apiKeyConfigured: Boolean(process.env.TRANSLATE_API_KEY),
+    remoteConfigured: true,
     provider,
-    endpoint,
-    model: process.env.TRANSLATE_MODEL || "",
+    proxy,
     repositoryTranslations: true,
     localFallback: true
   };
@@ -973,28 +1161,22 @@ function serializeEnvValue(value) {
 }
 
 async function saveTranslationConfig(config) {
-  const allowedProviders = new Set(["generic", "openai-compatible", "google-free", "mymemory-free"]);
-  const provider = allowedProviders.has(config.provider) ? config.provider : defaultTranslateProvider;
-  const isFreeProvider = provider === "google-free" || provider === "mymemory-free";
-  const endpoint = isFreeProvider ? "" : String(config.endpoint || "").trim();
-  const model = provider === "openai-compatible" ? String(config.model || "").trim() : "";
-  const apiKey = String(config.apiKey || "").trim();
+  const provider = freeTranslateProvider(config.provider);
+  const proxyEnabled = parseBoolean(config.proxyEnabled, true);
+  const proxyUrl = normalizeProxyUrl(config.proxyUrl || defaultTranslateProxyUrl);
 
   process.env.TRANSLATE_PROVIDER = provider;
-  process.env.TRANSLATE_ENDPOINT = endpoint;
-  process.env.TRANSLATE_MODEL = model;
-  if (apiKey) {
-    process.env.TRANSLATE_API_KEY = apiKey;
-  } else if (isFreeProvider || config.clearApiKey) {
-    delete process.env.TRANSLATE_API_KEY;
-  }
+  delete process.env.TRANSLATE_ENDPOINT;
+  delete process.env.TRANSLATE_MODEL;
+  process.env.TRANSLATE_PROXY_ENABLED = proxyEnabled ? "1" : "0";
+  process.env.TRANSLATE_PROXY_URL = proxyUrl;
+  delete process.env.TRANSLATE_API_KEY;
 
   const lines = [
     "# Saved by Repo Viewer. Do not commit this file.",
     `TRANSLATE_PROVIDER=${serializeEnvValue(process.env.TRANSLATE_PROVIDER)}`,
-    `TRANSLATE_ENDPOINT=${serializeEnvValue(process.env.TRANSLATE_ENDPOINT)}`,
-    `TRANSLATE_MODEL=${serializeEnvValue(process.env.TRANSLATE_MODEL)}`,
-    `TRANSLATE_API_KEY=${serializeEnvValue(process.env.TRANSLATE_API_KEY || "")}`
+    `TRANSLATE_PROXY_ENABLED=${serializeEnvValue(process.env.TRANSLATE_PROXY_ENABLED)}`,
+    `TRANSLATE_PROXY_URL=${serializeEnvValue(process.env.TRANSLATE_PROXY_URL)}`
   ];
   await writeFile(envPath, `${lines.join("\n")}\n`, "utf8");
   translationCache.clear();
@@ -1081,7 +1263,7 @@ async function handleTranslate(request, response) {
 
   try {
     translated = await translateMarkdownWithoutCode(text, targetLanguage, sourceLanguage);
-    if (translated) provider = process.env.TRANSLATE_PROVIDER || defaultTranslateProvider;
+    if (translated) provider = freeTranslateProvider(process.env.TRANSLATE_PROVIDER);
   } catch (error) {
     translated = null;
     fallbackReason = error.message || "Remote translation failed.";
@@ -1089,10 +1271,6 @@ async function handleTranslate(request, response) {
   }
 
   if (!translated) {
-    const configuredProvider = process.env.TRANSLATE_PROVIDER || defaultTranslateProvider;
-    if (!process.env.TRANSLATE_ENDPOINT && configuredProvider !== "google-free" && configuredProvider !== "mymemory-free") {
-      fallbackReason = "TRANSLATE_ENDPOINT is not configured.";
-    }
     translateLog("request-local-fallback", { path: sourcePath || "(inline)", reason: fallbackReason || "empty translation" });
     translated = localTranslateMarkdownWithoutCode(text, targetLanguage);
   }
@@ -1198,13 +1376,8 @@ if (process.argv.includes("--check")) {
     console.log(`Default repository: ${defaultRepoRoot}`);
     console.log(`Translation provider: ${process.env.TRANSLATE_PROVIDER || defaultTranslateProvider}`);
     console.log(`Translation config: ${envPath}`);
-    proxyForUrl("https://translate.googleapis.com")
-      .then((proxyInfo) => {
-        const proxyLabel = proxyInfo.url ? `${proxyInfo.source}:${redactProxyUrl(proxyInfo.url)}` : proxyInfo.source;
-        console.log(`Translation proxy: ${proxyLabel}`);
-      })
-      .catch((error) => {
-        console.log(`Translation proxy: detect failed (${errorMessage(error)})`);
-      });
+    const proxyInfo = proxyForUrl();
+    const proxyLabel = proxyInfo.url ? `${proxyInfo.source}:${redactProxyUrl(proxyInfo.url)}` : proxyInfo.source;
+    console.log(`Translation proxy: ${proxyLabel}`);
   });
 }

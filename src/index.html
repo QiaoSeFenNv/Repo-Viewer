@@ -94,28 +94,25 @@
               <select id="configProvider" name="provider">
                 <option value="google-free">Google 免费端点 + MyMemory 备用</option>
                 <option value="mymemory-free">MyMemory 免费端点</option>
-                <option value="openai-compatible">OpenAI-compatible</option>
-                <option value="generic">Generic POST</option>
               </select>
             </label>
-            <label data-config-field="endpoint">
-              Endpoint
-              <input id="configEndpoint" name="endpoint" placeholder="免费端点可留空；AI/Generic 填接口地址" />
-            </label>
-            <label data-config-field="model">
-              Model
-              <input id="configModel" name="model" placeholder="gpt-4.1-mini / qwen2.5:7b" />
-            </label>
-            <label data-config-field="apiKey">
-              API Key
-              <input id="configApiKey" name="apiKey" type="password" placeholder="留空则保留当前 key" autocomplete="off" />
-            </label>
-            <label class="check-row" data-config-field="apiKey">
-              <input id="clearApiKey" name="clearApiKey" type="checkbox" />
-              清空已保存 API Key
-            </label>
+            <div class="config-section proxy-section">
+              <div class="section-title">
+                <span>翻译代理</span>
+                <small>Windows / macOS / Linux</small>
+              </div>
+              <label class="check-row proxy-toggle">
+                <input id="configProxyEnabled" name="proxyEnabled" type="checkbox" />
+                翻译请求使用代理
+              </label>
+              <label class="proxy-url">
+                Proxy URL
+                <input id="configProxyUrl" name="proxyUrl" placeholder="http://127.0.0.1:7897" autocomplete="off" />
+              </label>
+              <p class="field-note">默认使用本地 HTTP 代理地址。关闭后翻译请求直接访问外网；保存后立即生效。</p>
+            </div>
           </div>
-          <p id="configHint" class="config-hint">Google/MyMemory 免费端点无需 API Key；AI/Generic 配置仍会保留。</p>
+          <p id="configHint" class="config-hint">仅使用免费翻译源。代码块和常见代码文件会原样保留，不会发送到翻译服务。</p>
           <div class="dialog-actions">
             <button id="saveTranslationConfig" type="submit">保存配置</button>
           </div>
