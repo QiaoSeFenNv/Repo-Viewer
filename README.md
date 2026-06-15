@@ -92,47 +92,6 @@ TRANSLATE_PROVIDER=mymemory-free
 
 `google-free` uses an unofficial Google Translate endpoint. It needs no API key. `mymemory-free` also needs no API key and is best for shorter text.
 
-## Translation diagnostics and proxy
 
-Repo Viewer prints translation diagnostics in the terminal by default. The logs include the selected provider, chunk count, HTTP host, proxy source, elapsed time, and fallback reason. They do not print source document text or API keys.
+[LinuxDo](https://linux.do/)
 
-Markdown text is translated in batches while fenced code blocks and inline code are kept out of translation requests. The default batch settings reduce many tiny translation calls:
-
-```env
-TRANSLATE_BATCH_CHARS=3200
-TRANSLATE_BATCH_ITEMS=24
-```
-
-Translation proxy is configured explicitly in the page `配置` dialog. It is not auto-detected from the operating system. The default proxy URL is:
-
-```env
-TRANSLATE_PROXY_ENABLED=1
-TRANSLATE_PROXY_URL=http://127.0.0.1:7897
-```
-
-The same proxy setting is used on Windows, macOS, and Linux. Turn it off in the dialog when the machine does not have a local proxy, or change the URL to the user's proxy port.
-
-Useful diagnostics:
-
-```powershell
-$env:TRANSLATE_LOG="1"
-npx @8865a/repo-viewer --check --root C:\path\to\repo
-npx @8865a/repo-viewer C:\path\to\repo
-```
-
-To turn translation logs off:
-
-```powershell
-$env:TRANSLATE_LOG="0"
-```
-
-When running through the CLI, the page configuration dialog writes to `.repo-viewer.env` in the directory where the command was started. In local development it writes to `.env` in this project. Both files are ignored by git.
-
-## API
-
-- `GET /api/tree?root=<path>&path=<dir>`: read one directory level.
-- `GET /api/file?root=<path>&path=<file>`: read a file preview.
-- `GET /api/raw?root=<path>&path=<file>`: stream raw assets.
-- `POST /api/translate`: translate Markdown/text while preserving code.
-- `GET /api/translation-status`: inspect translation provider status.
-- `POST /api/translation-config`: save translation provider settings.
