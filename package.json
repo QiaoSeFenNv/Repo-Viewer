@@ -1,12 +1,25 @@
 {
-  "name": "repo-viewer",
-  "version": "0.1.0",
-  "private": true,
+  "name": "@8865a/repo-viewer",
+  "version": "0.1.1",
   "type": "module",
   "description": "Local GitHub repository visual browser with file tree, preview, and translation layer.",
+  "bin": {
+    "repo-viewer": "bin/repo-viewer.js"
+  },
+  "files": [
+    "bin",
+    "server",
+    "src",
+    ".env.example",
+    "README.md",
+    "package.json"
+  ],
   "scripts": {
     "start": "node server/index.js",
     "check": "node server/index.js --check"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "engines": {
     "node": ">=18"

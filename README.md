@@ -14,7 +14,43 @@ Repo Viewer is a local web app for reading GitHub repositories as a browsable, t
 - Translation providers: repository-local translations, free Google endpoint with MyMemory fallback, MyMemory, OpenAI-compatible APIs, or a custom generic POST endpoint.
 - Themes: paper, light, dark, eye-care green, and high contrast.
 
-## Run
+## Run with npx
+
+```bash
+npx @8865a/repo-viewer C:\path\to\repo
+```
+
+Or pass options explicitly:
+
+```bash
+npx @8865a/repo-viewer --root C:\path\to\repo --port 4173
+```
+
+The command starts a local web server and prints the browser URL:
+
+```text
+Repo Viewer running at http://localhost:4173
+```
+
+If no repository path is provided, Repo Viewer opens the current working directory.
+
+## Global install
+
+```bash
+npm install -g @8865a/repo-viewer
+repo-viewer C:\path\to\repo
+```
+
+Useful CLI options:
+
+```bash
+repo-viewer --help
+repo-viewer --version
+repo-viewer --check --root C:\path\to\repo
+repo-viewer --root C:\path\to\repo --port 4180
+```
+
+## Local development
 
 ```bash
 npm start
@@ -26,11 +62,7 @@ Open:
 http://localhost:4173
 ```
 
-By default the app reads:
-
-```text
-C:\Files\Code\readerGithub\ECC-main
-```
+By default the app reads the current working directory.
 
 To open another local repository, paste its absolute path into the top input and click `读取`, or pass it in the URL:
 
@@ -52,11 +84,39 @@ Free providers:
 TRANSLATE_PROVIDER=google-free
 ```
 
+`google-free` is the default provider when no local translation config exists.
+
 ```env
 TRANSLATE_PROVIDER=mymemory-free
 ```
 
 `google-free` uses an unofficial Google Translate endpoint. It needs no API key. On Windows, the app can fall back to the system PowerShell HTTP stack when Node's direct Google request is blocked or slow. `mymemory-free` also needs no API key and is best for shorter text.
+
+## Translation diagnostics and proxy
+
+Repo Viewer prints translation diagnostics in the terminal by default. The logs include the selected provider, chunk count, HTTP host, proxy source, elapsed time, and fallback reason. They do not print source document text or API keys.
+
+On Windows, translation requests automatically use the current system proxy when one is configured in Windows Internet Settings. Environment proxies are also recognized:
+
+```powershell
+$env:HTTPS_PROXY="http://127.0.0.1:7897"
+$env:TRANSLATE_PROVIDER="google-free"
+npx @8865a/repo-viewer C:\path\to\repo
+```
+
+Useful diagnostics:
+
+```powershell
+$env:TRANSLATE_LOG="1"
+npx @8865a/repo-viewer --check --root C:\path\to\repo
+npx @8865a/repo-viewer C:\path\to\repo
+```
+
+To turn translation logs off:
+
+```powershell
+$env:TRANSLATE_LOG="0"
+```
 
 AI-compatible provider:
 
@@ -75,7 +135,7 @@ TRANSLATE_ENDPOINT=http://localhost:8080/translate
 TRANSLATE_API_KEY=
 ```
 
-The page configuration dialog writes to local `.env` and applies changes immediately. `.env` is ignored by git.
+When running through the CLI, the page configuration dialog writes to `.repo-viewer.env` in the directory where the command was started. In local development it writes to `.env` in this project. Both files are ignored by git.
 
 ## API
 

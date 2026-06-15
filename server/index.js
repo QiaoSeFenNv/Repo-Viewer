@@ -10,12 +10,11 @@ import { fileURLToPath } from "node:url";
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const projectRoot = resolve(__dirname, "..");
 const staticRoot = join(projectRoot, "src");
-const defaultRepoRoot = resolve(projectRoot, "..", "ECC-main");
+const defaultRepoRoot = resolve(process.env.REPO_ROOT || process.cwd());
+const envPath = resolve(process.env.REPO_VIEWER_ENV_PATH || join(projectRoot, ".env"));
 const execFileAsync = promisify(execFile);
-let googleFetchMode = "auto";
 
 async function loadEnvFile() {
-  const envPath = join(projectRoot, ".env");
   if (!existsSync(envPath)) return;
 
   const content = await readFile(envPath, "utf8");
@@ -38,6 +37,10 @@ await loadEnvFile();
 const port = Number(process.env.PORT || 4173);
 const maxTextBytes = Number(process.env.MAX_TEXT_BYTES || 1024 * 1024);
 const maxTreeEntries = Number(process.env.MAX_TREE_ENTRIES || 12000);
+const defaultTranslateProvider = "google-free";
+const translateTimeoutMs = Number(process.env.TRANSLATE_TIMEOUT_MS || 20000);
+const translateLogEnabled = process.env.TRANSLATE_LOG !== "0" && process.env.REPO_VIEWER_TRANSLATE_LOG !== "0";
+let windowsProxyConfigPromise = null;
 
 const ignoredNames = new Set([
   ".git",
@@ -645,55 +648,218 @@ function normalizeFreeLanguage(language) {
   return map[language] || language;
 }
 
+function translateLog(event, details = {}) {
+  if (!translateLogEnabled) return;
+  const fields = Object.entries(details)
+    .filter(([, value]) => value !== undefined && value !== null && value !== "")
+    .map(([key, value]) => `${key}=${value}`)
+    .join(" ");
+  console.log(`[translate] ${new Date().toISOString()} ${event}${fields ? ` ${fields}` : ""}`);
+}
+
+function durationSince(startedAt) {
+  return `${Date.now() - startedAt}ms`;
+}
+
+function errorMessage(error) {
+  return error?.message || String(error);
+}
+
+function redactProxyUrl(proxyUrl) {
+  if (!proxyUrl) return "";
+  try {
+    const url = new URL(proxyUrl);
+    if (url.username) url.username = "***";
+    if (url.password) url.password = "***";
+    return url.toString();
+  } catch {
+    return proxyUrl.replace(/\/\/[^@/]+@/, "//***@");
+  }
+}
+
+function normalizeProxyUrl(value) {
+  const proxy = String(value || "").trim();
+  if (!proxy) return "";
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(proxy)) return proxy;
+  return `http://${proxy}`;
+}
+
+function envProxyForUrl(targetUrl) {
+  const protocol = new URL(String(targetUrl)).protocol;
+  const candidates =
+    protocol === "https:"
+      ? ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"]
+      : ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
+  for (const name of candidates) {
+    const value = process.env[name];
+    if (value) {
+      return {
+        source: process.platform === "win32" ? name : `${name}-unsupported`,
+        url: process.platform === "win32" ? normalizeProxyUrl(value) : "",
+        usePowerShell: process.platform === "win32"
+      };
+    }
+  }
+  return null;
+}
+
+function selectWindowsProxy(proxyServer, protocol) {
+  const raw = String(proxyServer || "").trim();
+  if (!raw) return "";
+  if (!raw.includes("=")) return normalizeProxyUrl(raw.split(";")[0]);
+
+  const entries = new Map();
+  for (const part of raw.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator < 1) continue;
+    entries.set(part.slice(0, separator).trim().toLowerCase(), part.slice(separator + 1).trim());
+  }
+
+  const key = protocol.replace(":", "").toLowerCase();
+  return normalizeProxyUrl(entries.get(key) || entries.get("http") || entries.values().next().value || "");
+}
+
+async function windowsProxyConfig() {
+  if (process.platform !== "win32" || process.env.REPO_VIEWER_DISABLE_SYSTEM_PROXY === "1") return null;
+  if (!windowsProxyConfigPromise) {
+    windowsProxyConfigPromise = execFileAsync(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-Command",
+        [
+          "$p=Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings';",
+          "[Console]::OutputEncoding=[Text.UTF8Encoding]::UTF8;",
+          "[pscustomobject]@{ProxyEnable=$p.ProxyEnable;ProxyServer=$p.ProxyServer;AutoConfigURL=$p.AutoConfigURL}|ConvertTo-Json -Compress"
+        ].join(" ")
+      ],
+      { timeout: 5000, windowsHide: true, maxBuffer: 1024 * 256 }
+    )
+      .then(({ stdout }) => JSON.parse(stdout || "{}"))
+      .catch((error) => {
+        translateLog("proxy-detect-failed", { error: errorMessage(error) });
+        return null;
+      });
+  }
+  return windowsProxyConfigPromise;
+}
+
+async function proxyForUrl(targetUrl) {
+  const envProxy = envProxyForUrl(targetUrl);
+  if (envProxy) return envProxy;
+
+  const config = await windowsProxyConfig();
+  if (!config) return { source: "none", url: "", usePowerShell: false };
+
+  const proxyEnabled = Number(config.ProxyEnable) === 1;
+  const proxyUrl = proxyEnabled ? selectWindowsProxy(config.ProxyServer, new URL(String(targetUrl)).protocol) : "";
+  if (proxyUrl) return { source: "windows-system", url: proxyUrl, usePowerShell: true };
+  if (config.AutoConfigURL) return { source: "windows-pac", url: "", usePowerShell: true };
+  return { source: "none", url: "", usePowerShell: false };
+}
+
+async function fetchJsonWithPowerShell(url, options = {}, proxyInfo = {}) {
+  const headers = options.headers || {};
+  const env = {
+    ...process.env,
+    REPO_VIEWER_REQUEST_URL: String(url),
+    REPO_VIEWER_REQUEST_METHOD: options.method || "GET",
+    REPO_VIEWER_REQUEST_BODY: options.body || "",
+    REPO_VIEWER_REQUEST_CONTENT_TYPE: headers["content-type"] || headers["Content-Type"] || "",
+    REPO_VIEWER_REQUEST_AUTHORIZATION: headers.authorization || headers.Authorization || "",
+    REPO_VIEWER_PROXY_URL: proxyInfo.url || ""
+  };
+  const command = [
+    "[Console]::OutputEncoding=[Text.UTF8Encoding]::UTF8;",
+    "$headers=@{};",
+    "if ($env:REPO_VIEWER_REQUEST_AUTHORIZATION) { $headers['Authorization']=$env:REPO_VIEWER_REQUEST_AUTHORIZATION };",
+    "$params=@{Uri=$env:REPO_VIEWER_REQUEST_URL;Method=$env:REPO_VIEWER_REQUEST_METHOD;TimeoutSec=[Math]::Ceiling($env:REPO_VIEWER_TIMEOUT_MS/1000);UseBasicParsing=$true};",
+    "if ($headers.Count -gt 0) { $params.Headers=$headers };",
+    "if ($env:REPO_VIEWER_REQUEST_BODY) { $params.Body=$env:REPO_VIEWER_REQUEST_BODY; if ($env:REPO_VIEWER_REQUEST_CONTENT_TYPE) { $params.ContentType=$env:REPO_VIEWER_REQUEST_CONTENT_TYPE } else { $params.ContentType='application/json; charset=utf-8' } };",
+    "if ($env:REPO_VIEWER_PROXY_URL) { $params.Proxy=$env:REPO_VIEWER_PROXY_URL };",
+    "(Invoke-WebRequest @params).Content"
+  ].join(" ");
+  const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-Command", command], {
+    timeout: options.timeoutMs || translateTimeoutMs + 5000,
+    windowsHide: true,
+    maxBuffer: 1024 * 1024 * 8,
+    env: { ...env, REPO_VIEWER_TIMEOUT_MS: String(options.timeoutMs || translateTimeoutMs) }
+  });
+  return JSON.parse(stdout);
+}
+
+async function fetchJson(url, options = {}) {
+  const startedAt = Date.now();
+  const target = new URL(String(url));
+  const proxyInfo = await proxyForUrl(target);
+  const method = options.method || "GET";
+  const proxyLabel = proxyInfo.url ? `${proxyInfo.source}:${redactProxyUrl(proxyInfo.url)}` : proxyInfo.source;
+  const usePowerShell = process.platform === "win32" && (proxyInfo.usePowerShell || proxyInfo.url);
+
+  translateLog("http-start", { method, host: target.host, mode: usePowerShell ? "powershell" : "node-fetch", proxy: proxyLabel });
+
+  if (usePowerShell) {
+    try {
+      const data = await fetchJsonWithPowerShell(url, options, proxyInfo);
+      translateLog("http-ok", { method, host: target.host, mode: "powershell", elapsed: durationSince(startedAt) });
+      return data;
+    } catch (error) {
+      translateLog("http-failed", { method, host: target.host, mode: "powershell", elapsed: durationSince(startedAt), error: errorMessage(error) });
+      throw error;
+    }
+  }
+
+  try {
+    const response = await fetch(url, {
+      method,
+      headers: options.headers,
+      body: options.body,
+      signal: AbortSignal.timeout(options.timeoutMs || translateTimeoutMs)
+    });
+    if (!response.ok) throw new Error(`${target.host} returned ${response.status}`);
+    const data = await response.json();
+    translateLog("http-ok", { method, host: target.host, mode: "node-fetch", elapsed: durationSince(startedAt) });
+    return data;
+  } catch (error) {
+    if (process.platform !== "win32") {
+      translateLog("http-failed", { method, host: target.host, mode: "node-fetch", elapsed: durationSince(startedAt), error: errorMessage(error) });
+      throw error;
+    }
+    translateLog("http-retry", { method, host: target.host, from: "node-fetch", to: "powershell", error: errorMessage(error) });
+    try {
+      const data = await fetchJsonWithPowerShell(url, options, proxyInfo);
+      translateLog("http-ok", { method, host: target.host, mode: "powershell", elapsed: durationSince(startedAt) });
+      return data;
+    } catch (retryError) {
+      translateLog("http-failed", { method, host: target.host, mode: "powershell", elapsed: durationSince(startedAt), error: errorMessage(retryError) });
+      throw retryError;
+    }
+  }
+}
+
 async function googleFreeTranslate(text, targetLanguage, sourceLanguage) {
   const chunks = splitForTranslation(text);
   const translatedChunks = [];
-  for (const chunk of chunks) {
+  translateLog("provider-start", { provider: "google-free", chunks: chunks.length, chars: text.length, target: targetLanguage });
+  for (const [index, chunk] of chunks.entries()) {
     const url = new URL("https://translate.googleapis.com/translate_a/single");
     url.searchParams.set("client", "gtx");
     url.searchParams.set("sl", sourceLanguage === "auto" ? "auto" : normalizeFreeLanguage(sourceLanguage));
     url.searchParams.set("tl", normalizeFreeLanguage(targetLanguage));
     url.searchParams.set("dt", "t");
     url.searchParams.set("q", chunk);
+    translateLog("chunk-start", { provider: "google-free", chunk: `${index + 1}/${chunks.length}`, chars: chunk.length });
     const data = await fetchGoogleFreeJson(url);
     const translated = data?.[0]?.map((part) => part?.[0] || "").join("");
     if (!translated) throw new Error("Google free translate returned an empty result.");
     translatedChunks.push(translated);
+    translateLog("chunk-ok", { provider: "google-free", chunk: `${index + 1}/${chunks.length}` });
   }
   return translatedChunks.join("\n\n");
 }
 
 async function fetchGoogleFreeJson(url) {
-  if (googleFetchMode === "powershell") {
-    return fetchGoogleFreeJsonWithPowerShell(url);
-  }
-  try {
-    const response = await fetch(url, { signal: AbortSignal.timeout(1500) });
-    if (!response.ok) throw new Error(`Google free translate returned ${response.status}`);
-    return await response.json();
-  } catch (error) {
-    if (process.platform !== "win32") throw error;
-    googleFetchMode = "powershell";
-    return fetchGoogleFreeJsonWithPowerShell(url);
-  }
-}
-
-async function fetchGoogleFreeJsonWithPowerShell(url) {
-  const { stdout } = await execFileAsync(
-    "powershell.exe",
-    [
-      "-NoProfile",
-      "-Command",
-      "[Console]::OutputEncoding=[Text.UTF8Encoding]::UTF8; $u=$env:REPO_VIEWER_TRANSLATE_URL; (Invoke-WebRequest -Uri $u -TimeoutSec 20 -UseBasicParsing).Content"
-    ],
-    {
-      timeout: 25000,
-      windowsHide: true,
-      maxBuffer: 1024 * 1024 * 8,
-      env: { ...process.env, REPO_VIEWER_TRANSLATE_URL: String(url) }
-    }
-  );
-  return JSON.parse(stdout);
+  return fetchJson(url, { timeoutMs: translateTimeoutMs });
 }
 
 async function myMemoryTranslate(text, targetLanguage, sourceLanguage) {
@@ -701,26 +867,29 @@ async function myMemoryTranslate(text, targetLanguage, sourceLanguage) {
   const translatedChunks = [];
   const source = sourceLanguage === "auto" ? "en" : normalizeFreeLanguage(sourceLanguage);
   const target = normalizeFreeLanguage(targetLanguage);
-  for (const chunk of chunks) {
+  translateLog("provider-start", { provider: "mymemory-free", chunks: chunks.length, chars: text.length, target: targetLanguage });
+  for (const [index, chunk] of chunks.entries()) {
     const url = new URL("https://api.mymemory.translated.net/get");
     url.searchParams.set("q", chunk);
     url.searchParams.set("langpair", `${source}|${target}`);
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`MyMemory translate returned ${response.status}`);
-    const data = await response.json();
+    translateLog("chunk-start", { provider: "mymemory-free", chunk: `${index + 1}/${chunks.length}`, chars: chunk.length });
+    const data = await fetchJson(url, { timeoutMs: translateTimeoutMs });
     const translated = data?.responseData?.translatedText;
     if (!translated) throw new Error("MyMemory translate returned an empty result.");
     translatedChunks.push(translated);
+    translateLog("chunk-ok", { provider: "mymemory-free", chunk: `${index + 1}/${chunks.length}` });
   }
   return translatedChunks.join("\n\n");
 }
 
 async function remoteTranslate(text, targetLanguage, sourceLanguage) {
-  const provider = process.env.TRANSLATE_PROVIDER || "generic";
+  const provider = process.env.TRANSLATE_PROVIDER || defaultTranslateProvider;
+  translateLog("remote-provider", { provider, chars: text.length, target: targetLanguage });
   if (provider === "google-free") {
     try {
       return await googleFreeTranslate(text, targetLanguage, sourceLanguage);
     } catch (error) {
+      translateLog("provider-fallback", { from: "google-free", to: "mymemory-free", error: errorMessage(error) });
       return myMemoryTranslate(text, targetLanguage, sourceLanguage);
     }
   }
@@ -738,7 +907,7 @@ async function remoteTranslate(text, targetLanguage, sourceLanguage) {
     const model = process.env.TRANSLATE_MODEL;
     if (!model) throw new Error("TRANSLATE_MODEL is required for openai-compatible provider.");
 
-    const response = await fetch(endpoint, {
+    const data = await fetchJson(endpoint, {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -755,14 +924,13 @@ async function remoteTranslate(text, targetLanguage, sourceLanguage) {
             content: `Translate from ${sourceLanguage} to ${targetLanguage}:\n\n${text}`
           }
         ]
-      })
+      }),
+      timeoutMs: translateTimeoutMs
     });
-    if (!response.ok) throw new Error(`OpenAI-compatible endpoint returned ${response.status}`);
-    const data = await response.json();
     return data.choices?.[0]?.message?.content || null;
   }
 
-  const response = await fetch(endpoint, {
+  const data = await fetchJson(endpoint, {
     method: "POST",
     headers,
     body: JSON.stringify({
@@ -771,20 +939,16 @@ async function remoteTranslate(text, targetLanguage, sourceLanguage) {
       sourceLanguage,
       preserveMarkdown: true,
       preserveCodeBlocks: true
-    })
+    }),
+    timeoutMs: translateTimeoutMs
   });
 
-  if (!response.ok) {
-    throw new Error(`Translation endpoint returned ${response.status}`);
-  }
-
-  const data = await response.json();
   return data.translation || data.translatedText || data.text || null;
 }
 
 function translationConfig() {
   const endpoint = process.env.TRANSLATE_ENDPOINT || "";
-  const provider = process.env.TRANSLATE_PROVIDER || "generic";
+  const provider = process.env.TRANSLATE_PROVIDER || defaultTranslateProvider;
   const freeProvider = provider === "google-free" || provider === "mymemory-free";
   return {
     remoteConfigured: freeProvider || Boolean(endpoint && (provider !== "openai-compatible" || process.env.TRANSLATE_MODEL)),
@@ -810,7 +974,7 @@ function serializeEnvValue(value) {
 
 async function saveTranslationConfig(config) {
   const allowedProviders = new Set(["generic", "openai-compatible", "google-free", "mymemory-free"]);
-  const provider = allowedProviders.has(config.provider) ? config.provider : "generic";
+  const provider = allowedProviders.has(config.provider) ? config.provider : defaultTranslateProvider;
   const isFreeProvider = provider === "google-free" || provider === "mymemory-free";
   const endpoint = isFreeProvider ? "" : String(config.endpoint || "").trim();
   const model = provider === "openai-compatible" ? String(config.model || "").trim() : "";
@@ -832,7 +996,7 @@ async function saveTranslationConfig(config) {
     `TRANSLATE_MODEL=${serializeEnvValue(process.env.TRANSLATE_MODEL)}`,
     `TRANSLATE_API_KEY=${serializeEnvValue(process.env.TRANSLATE_API_KEY || "")}`
   ];
-  await writeFile(join(projectRoot, ".env"), `${lines.join("\n")}\n`, "utf8");
+  await writeFile(envPath, `${lines.join("\n")}\n`, "utf8");
   translationCache.clear();
   return translationConfig();
 }
@@ -852,6 +1016,7 @@ async function handleSaveTranslationConfig(request, response) {
 }
 
 async function handleTranslate(request, response) {
+  const requestStartedAt = Date.now();
   let payload = "";
   for await (const chunk of request) {
     payload += chunk;
@@ -868,14 +1033,22 @@ async function handleTranslate(request, response) {
   const sourcePath = String(body.path || "");
   const root = body.root ? safeRoot(String(body.root)) : null;
   const key = createHash("sha256").update(`${targetLanguage}:${sourceLanguage}:${sourcePath}:${text}`).digest("hex");
+  translateLog("request-start", {
+    path: sourcePath || "(inline)",
+    provider: process.env.TRANSLATE_PROVIDER || defaultTranslateProvider,
+    target: targetLanguage,
+    chars: text.length
+  });
 
   if (translationCache.has(key)) {
+    translateLog("request-cache-hit", { path: sourcePath || "(inline)", elapsed: durationSince(requestStartedAt) });
     sendJson(response, 200, { ...translationCache.get(key), cached: true });
     return;
   }
 
   const repositoryTranslation = await findRepositoryTranslation(root, sourcePath, targetLanguage);
   if (repositoryTranslation) {
+    translateLog("request-repository-hit", { path: sourcePath, translation: repositoryTranslation.candidatePath, elapsed: durationSince(requestStartedAt) });
     const result = {
       translatedText: repositoryTranslation.translatedText,
       targetLanguage,
@@ -893,6 +1066,7 @@ async function handleTranslate(request, response) {
   let fallbackReason = "";
 
   if (!shouldTranslateFile(body)) {
+    translateLog("request-skipped-code", { path: sourcePath || "(inline)", chars: text.length, elapsed: durationSince(requestStartedAt) });
     const result = {
       translatedText: text,
       targetLanguage,
@@ -907,17 +1081,19 @@ async function handleTranslate(request, response) {
 
   try {
     translated = await translateMarkdownWithoutCode(text, targetLanguage, sourceLanguage);
-    if (translated) provider = process.env.TRANSLATE_PROVIDER || "remote";
+    if (translated) provider = process.env.TRANSLATE_PROVIDER || defaultTranslateProvider;
   } catch (error) {
     translated = null;
     fallbackReason = error.message || "Remote translation failed.";
+    translateLog("request-remote-failed", { path: sourcePath || "(inline)", error: errorMessage(error) });
   }
 
   if (!translated) {
-    const configuredProvider = process.env.TRANSLATE_PROVIDER || "generic";
+    const configuredProvider = process.env.TRANSLATE_PROVIDER || defaultTranslateProvider;
     if (!process.env.TRANSLATE_ENDPOINT && configuredProvider !== "google-free" && configuredProvider !== "mymemory-free") {
       fallbackReason = "TRANSLATE_ENDPOINT is not configured.";
     }
+    translateLog("request-local-fallback", { path: sourcePath || "(inline)", reason: fallbackReason || "empty translation" });
     translated = localTranslateMarkdownWithoutCode(text, targetLanguage);
   }
 
@@ -929,6 +1105,7 @@ async function handleTranslate(request, response) {
     fallbackReason
   };
   translationCache.set(key, result);
+  translateLog("request-done", { path: sourcePath || "(inline)", provider, elapsed: durationSince(requestStartedAt), fallback: fallbackReason ? "yes" : "no" });
   sendJson(response, 200, result);
 }
 
@@ -1019,5 +1196,15 @@ if (process.argv.includes("--check")) {
   createServer(handleRequest).listen(port, () => {
     console.log(`Repo Viewer running at http://localhost:${port}`);
     console.log(`Default repository: ${defaultRepoRoot}`);
+    console.log(`Translation provider: ${process.env.TRANSLATE_PROVIDER || defaultTranslateProvider}`);
+    console.log(`Translation config: ${envPath}`);
+    proxyForUrl("https://translate.googleapis.com")
+      .then((proxyInfo) => {
+        const proxyLabel = proxyInfo.url ? `${proxyInfo.source}:${redactProxyUrl(proxyInfo.url)}` : proxyInfo.source;
+        console.log(`Translation proxy: ${proxyLabel}`);
+      })
+      .catch((error) => {
+        console.log(`Translation proxy: detect failed (${errorMessage(error)})`);
+      });
   });
 }
